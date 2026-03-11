@@ -56,7 +56,7 @@
 
 (require 'cl-lib)
 (require 'seq)
-(require 'tramp)
+(require 'comint)
 
 ;;; ── Customization ─────────────────────────────────────────────────────────────
 
@@ -214,10 +214,10 @@ vterm's character-mode input handler passes them to Emacs.
 Called from `vterm-mode-hook' so that vterm is guaranteed to be loaded
 before `vterm-keymap-exceptions' is referenced.  `cl-pushnew' is used
 instead of `add-to-list' for idempotent per-buffer safety."
-  (dolist (key popterm--vterm-passthrough-keys)
-    (cl-pushnew key vterm-keymap-exceptions :test #'equal)))
+  (when (boundp 'vterm-keymap-exceptions)
+    (dolist (key popterm--vterm-passthrough-keys)
+      (cl-pushnew key vterm-keymap-exceptions :test #'equal))))
 
-(add-hook 'vterm-mode-hook #'popterm--vterm-setup)
 
 ;;; ── Backend helpers ───────────────────────────────────────────────────────────
 
@@ -255,16 +255,14 @@ popping a window or disturbing the current layout."
               ('vterm
                (if (fboundp 'vterm)
                    (let ((vterm-buffer-name (popterm--buffer-name name backend)))
-                     (vterm))
+                     (vterm)
+                     (get-buffer vterm-buffer-name))
                  (user-error "popterm: Vterm not installed")))
               ('eat
                ;; Mirror the vterm pattern: bind eat-buffer-name so eat
                ;; creates the buffer under our name rather than *eat*.
                ;; Do NOT pre-create the buffer — eat must own its buffer
                ;; from the start so the PTY process is attached correctly.
-               ;; Explicitly fetch the buffer after calling (eat) rather than
-               ;; relying on its return value: interactive emulator entry
-               ;; points may return a window object or nil, not a buffer.
                (if (fboundp 'eat)
                    (let ((eat-buffer-name (popterm--buffer-name name backend)))
                      (eat)
@@ -347,7 +345,10 @@ Guards against a killed-but-not-yet-GC'd buffer by verifying
 (defun popterm-cd-string (source-buf)
   "Return a shell cd command string for the directory of SOURCE-BUF.
 Strips the TRAMP remote prefix so the command is valid on the remote host.
-Side-effect-free; part of the public API for custom integrations."
+Side-effect-free; part of the public API for custom integrations.
+
+This function uses `file-remote-p' when available and does not require TRAMP
+at load time."
   (with-current-buffer source-buf
     (let* ((dir    (or (and buffer-file-name
                             (file-name-directory buffer-file-name))
@@ -374,7 +375,8 @@ correct idioms for their respective backends."
          ((and (derived-mode-p 'eat-mode)
                (fboundp 'eat-term-send-string)
                (fboundp 'eat-self-input)
-               (bound-and-true-p eat-terminal))
+               (boundp 'eat-terminal)
+               eat-terminal)
           (eat-term-send-string eat-terminal cmd)
           (eat-self-input 1 'return))
          ((derived-mode-p 'comint-mode)
@@ -384,7 +386,7 @@ correct idioms for their respective backends."
          ((derived-mode-p 'eshell-mode)
           (goto-char (point-max))
           (insert cmd)
-          (eshell-send-input)))))))
+          (with-no-warnings (eshell-send-input))))))))
 
 ;;; ── Posframe display ─────────────────────────────────────────────────────────
 
@@ -411,9 +413,6 @@ the `popterm-posframe-focus-delay' window immediately after a show."
              (not (popterm--posframe-focused-p)))
     (popterm--posframe-hide)))
 
-;; Register once at load time.  The function is a no-op when no posframe
-;; is visible, so it is safe to leave permanently attached.
-(add-function :after after-focus-change-function #'popterm--after-focus-change)
 
 (defun popterm--posframe-show (buffer)
   "Show BUFFER in a centered posframe child frame."
@@ -423,23 +422,24 @@ the `popterm-posframe-focus-delay' window immediately after a show."
          (h (round (* (frame-height) popterm-posframe-height-ratio))))
     (setq popterm--frame-buffer buffer)
     (setq popterm--frame
-          (posframe-show
-           buffer
-           :poshandler            (or popterm-posframe-poshandler
-                                      #'posframe-poshandler-frame-center)
-           :left-fringe           8
-           :right-fringe          8
-           :width                 w
-           :height                h
-           :min-width             w
-           :min-height            h
-           :internal-border-width popterm-posframe-border-width
-           :internal-border-color (face-background 'region  nil t)
-           :background-color      (face-background 'default nil t)
-           :foreground-color      (face-foreground 'default nil t)
-           :override-parameters  '((cursor-type . t))
-           :respect-mode-line     t
-           :accept-focus          t))
+          (with-no-warnings
+            (posframe-show
+             buffer
+             :poshandler            (or popterm-posframe-poshandler
+                                        #'posframe-poshandler-frame-center)
+             :left-fringe           8
+             :right-fringe          8
+             :width                 w
+             :height                h
+             :min-width             w
+             :min-height            h
+             :internal-border-width popterm-posframe-border-width
+             :internal-border-color (face-background 'region  nil t)
+             :background-color      (face-background 'default nil t)
+             :foreground-color      (face-foreground 'default nil t)
+             :override-parameters  '((cursor-type . t))
+             :respect-mode-line     t
+             :accept-focus          t)))
     ;; Inhibit the hidehandler during the focus-transfer window.
     ;; Cancel any in-flight timer first: rapid key-repeat within the delay
     ;; window would otherwise spawn multiple timers, and the earliest would
@@ -466,7 +466,8 @@ lifecycle correctly, avoiding orphaned frames."
   (let ((parent (and (frame-live-p popterm--frame)
                      (frame-parent popterm--frame))))
     (when (buffer-live-p popterm--frame-buffer)
-      (posframe-hide popterm--frame-buffer))
+      (with-no-warnings
+        (posframe-hide popterm--frame-buffer)))
     (when parent
       (select-frame-set-input-focus parent)))
   (setq popterm--frame        nil
@@ -603,22 +604,26 @@ a new buffer when none exists in scope."
 
 ;;;###autoload
 (defun popterm-vterm  (&optional name)
-  "Toggle a vterm popup for optional instance NAME, regardless of `popterm-backend'."
+  "Toggle a vterm popup for optional instance NAME.
+Ignores `popterm-backend' setting."
   (interactive) (popterm-toggle name 'vterm))
 
 ;;;###autoload
 (defun popterm-eat (&optional name)
-  "Toggle an eat popup for optional instance NAME, regardless of `popterm-backend'."
+  "Toggle an eat popup for optional instance NAME.
+Ignores `popterm-backend' setting."
   (interactive) (popterm-toggle name 'eat))
 
 ;;;###autoload
 (defun popterm-shell (&optional name)
-  "Toggle a shell popup for optional instance NAME, regardless of `popterm-backend'."
+  "Toggle a shell popup for optional instance NAME.
+Ignores `popterm-backend' setting."
   (interactive) (popterm-toggle name 'shell))
 
 ;;;###autoload
 (defun popterm-eshell (&optional name)
-  "Toggle an eshell popup for optional instance NAME, regardless of `popterm-backend'."
+  "Toggle an eshell popup for optional instance NAME.
+Ignores `popterm-backend' setting."
   (interactive) (popterm-toggle name 'eshell))
 
 ;;; ── Buffer navigation ─────────────────────────────────────────────────────────
@@ -696,7 +701,33 @@ that is not currently shown."
                (eq (current-buffer) (window-buffer popterm--window)))
       (popterm--window-hide))))
 
-(add-hook 'kill-buffer-hook #'popterm--on-buffer-kill)
+;;; ── Global opt-in integration ───────────────────────────────────────────────
+
+;;;###autoload
+(define-minor-mode popterm-global-mode
+  "Enable global Popterm integration.
+
+When enabled, Popterm installs lightweight hooks needed for best behavior:
+
+- Add `popterm--vterm-setup' to `vterm-mode-hook' so Popterm keys work in vterm.
+- Add `popterm--after-focus-change' to `after-focus-change-function' so posframe
+  hides reliably when focus leaves the child frame.
+- Add `popterm--on-buffer-kill' to `kill-buffer-hook' so Popterm cleans up its
+  posframe/window if the active terminal buffer is killed.
+
+This mode is intentionally opt-in to avoid global side effects merely from
+loading the library (a common MELPA review requirement)."
+  :global t
+  :group 'popterm
+  (if popterm-global-mode
+      (progn
+        (add-hook 'vterm-mode-hook #'popterm--vterm-setup)
+        (add-function :after after-focus-change-function
+          #'popterm--after-focus-change)
+        (add-hook 'kill-buffer-hook #'popterm--on-buffer-kill))
+    (remove-hook 'vterm-mode-hook #'popterm--vterm-setup)
+    (remove-function after-focus-change-function #'popterm--after-focus-change)
+    (remove-hook 'kill-buffer-hook #'popterm--on-buffer-kill)))
 
 (provide 'popterm)
 ;;; popterm.el ends here

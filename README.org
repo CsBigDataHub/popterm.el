@@ -4,7 +4,7 @@
 *A smart, posframe-based terminal toggler for Emacs.*
 
 ~popterm~ merges the best paradigms of modern Emacs terminal management into a
-single bullet-proof package. It combines the aesthetic centered child-frames, the named-instance multiplexing of ~toggle-term.el~, and the TRAMP-aware scope-locking of ~vterm-toggle~.
+single package. It combines the aesthetic centered child-frames, the named-instance multiplexing of ~toggle-term.el~, and the TRAMP-aware scope-locking of ~vterm-toggle~.
 
 Whether you use ~vterm~, ~eat~, ~shell~, or ~eshell~, ~popterm~ provides a
 flawless, context-aware pop-up terminal experience that respects your window

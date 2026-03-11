@@ -209,9 +209,15 @@ vterm's character-mode input handler passes them to Emacs.
   '("C-<next>" "C-<prior>" "C-q")
   "Keys added to `vterm-keymap-exceptions' so `popterm-mode' bindings fire.")
 
-(with-eval-after-load 'vterm
+(defun popterm--vterm-setup ()
+  "Add `popterm--vterm-passthrough-keys' to `vterm-keymap-exceptions'.
+Called from `vterm-mode-hook' so that vterm is guaranteed to be loaded
+before `vterm-keymap-exceptions' is referenced.  `cl-pushnew' is used
+instead of `add-to-list' for idempotent per-buffer safety."
   (dolist (key popterm--vterm-passthrough-keys)
-    (add-to-list 'vterm-keymap-exceptions key)))
+    (cl-pushnew key vterm-keymap-exceptions :test #'equal)))
+
+(add-hook 'vterm-mode-hook #'popterm--vterm-setup)
 
 ;;; ── Backend helpers ───────────────────────────────────────────────────────────
 

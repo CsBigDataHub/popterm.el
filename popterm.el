@@ -178,6 +178,28 @@ Stored so that rapid successive toggles within `popterm-posframe-focus-delay'
 cancel the previous timer before spawning a new one, preventing a ghost
 timer from resetting the inhibit flag mid-flight on the next show cycle.")
 
+(defvar popterm--focus-guard-active nil
+  "Non-nil while the posframe focus guard is installed.
+Prevents duplicate installations of the `after-focus-change-function'
+advice.  The guard reclaims focus for the posframe whenever the user
+performs an operation (e.g. `C-x b') that lands focus on the parent
+frame while the posframe is still visible.")
+
+(defvar popterm--display-buffer-guard-active nil
+  "Non-nil while Popterm is preventing window redisplay of posframe buffers.
+Used together with `display-buffer-alist' so external packages cannot
+re-display the active popterm buffer in a regular window while the
+posframe session is active.")
+
+(defconst popterm--display-buffer-guard-entry
+  '(popterm--display-buffer-guard-p
+    (display-buffer-no-window)
+    (allow-no-window . t))
+  "`display-buffer-alist' entry that blocks window redisplay of popterm buffers.")
+
+(defconst popterm--display-buffer-prefix "*popterm-"
+  "Buffer-name prefix used by Popterm buffers.")
+
 ;;; ── Minor mode + vterm keymap passthrough ─────────────────────────────────────
 
 (defvar popterm-term-map
@@ -423,6 +445,81 @@ correct idioms for their respective backends."
         (insert cmd)
         (with-no-warnings (eshell-send-input)))))))
 
+;;; ── Posframe focus guard ──────────────────────────────────────────────────────
+
+(defun popterm--display-buffer-guard-p (buffer-or-name _action)
+  "Non-nil when BUFFER-OR-NAME should not be re-displayed in a normal window.
+This guard is only active while a popterm posframe session is active.  It
+blocks `display-buffer' from showing popterm buffers in the parent frame,
+which prevents packages such as ECA or gptel from splitting a normal
+window to display the active posframe buffer."
+  (and popterm--display-buffer-guard-active
+       (popterm--posframe-visible-p)
+       (let* ((buf (if (bufferp buffer-or-name)
+                       buffer-or-name
+                     (get-buffer buffer-or-name)))
+              (name (and buf (buffer-name buf))))
+         (and name
+              (string-prefix-p popterm--display-buffer-prefix name)))))
+
+(defun popterm--install-display-buffer-guard ()
+  "Prevent popterm buffers from being shown in regular windows."
+  (unless popterm--display-buffer-guard-active
+    (setq popterm--display-buffer-guard-active t)
+    (add-to-list 'display-buffer-alist popterm--display-buffer-guard-entry)))
+
+(defun popterm--remove-display-buffer-guard ()
+  "Allow popterm buffers to be shown in regular windows again."
+  (setq popterm--display-buffer-guard-active nil)
+  (setq display-buffer-alist
+        (delete popterm--display-buffer-guard-entry display-buffer-alist)))
+
+(defun popterm--posframe-focus-guard ()
+  "Reclaim focus for the popterm posframe when it is still visible.
+Intended for `after-focus-change-function'.  When the posframe is visible
+and the user has inadvertently landed focus on the parent frame (e.g. via
+`C-x b', `other-window', or a package that calls `display-buffer'), this
+function schedules focus to return to the posframe child frame.
+
+The guard is *not* triggered when:
+ • The minibuffer is active (user is mid-completion).
+ • Another child frame has focus (e.g. vertico-posframe, corfu-posframe).
+ • The inhibit flag is set (we are in the initial show/hide focus-delay).
+ • The posframe frame is no longer live/visible."
+  (when (and popterm--focus-guard-active
+             (not popterm--inhibit-hidehandler)
+             (popterm--posframe-visible-p)
+             ;; Don't fight with minibuffer interactions.
+             (not (active-minibuffer-window))
+             ;; Only act when the *parent* frame has focus — not when
+             ;; another child frame (vertico-posframe etc.) is focused.
+             (not (frame-parameter (selected-frame) 'parent-frame))
+             ;; The selected frame is the parent, not the popterm frame.
+             (not (eq (selected-frame) popterm--frame)))
+    ;; Use a zero-delay timer so we don't fight with the command that
+    ;; just transferred focus.  `run-at-time' with 0 runs after the
+    ;; current command cycle completes.
+    (run-at-time 0 nil
+                 (lambda ()
+                   (when (and popterm--focus-guard-active
+                              (popterm--posframe-visible-p)
+                              (not (active-minibuffer-window)))
+                     (select-frame-set-input-focus popterm--frame))))))
+
+(defun popterm--install-focus-guard ()
+  "Install the posframe focus guard on `after-focus-change-function'."
+  (unless popterm--focus-guard-active
+    (setq popterm--focus-guard-active t)
+    (add-function :after after-focus-change-function
+      #'popterm--posframe-focus-guard)))
+
+(defun popterm--remove-focus-guard ()
+  "Remove the posframe focus guard from `after-focus-change-function'."
+  (when popterm--focus-guard-active
+    (setq popterm--focus-guard-active nil)
+    (remove-function after-focus-change-function
+                     #'popterm--posframe-focus-guard)))
+
 ;;; ── Posframe display ─────────────────────────────────────────────────────────
 
 (defun popterm--posframe-hidehandler (_info)
@@ -440,7 +537,7 @@ trigger a hide:
      such as vertico-posframe, corfu-posframe, company-posframe, etc.
 
 Additionally, the minibuffer guard prevents hiding during standard
-minibuffer completion (M-x, C-x b, etc.) regardless of completion style.
+minibuffer completion regardless of completion style.
 
 The `popterm--inhibit-hidehandler' guard prevents spurious hides during
 the `popterm-posframe-focus-delay' window immediately after showing,
@@ -502,12 +599,22 @@ Fixes posframe#155 and seagle0128/.emacs.d#482."
       (setq-local cursor-type 'box)
       (goto-char (point-max))
       (when (fboundp 'vterm-reset-cursor-point)
-        (vterm-reset-cursor-point)))))
+        (vterm-reset-cursor-point)))
+    ;; Install guards so that operations landing focus on the parent
+    ;; frame return to the posframe, and external `display-buffer' calls
+    ;; cannot re-display popterm buffers in regular split windows.
+    (popterm--install-display-buffer-guard)
+    (popterm--install-focus-guard)))
 
 (defun popterm--posframe-hide ()
   "Hide the posframe via posframe's native API and restore parent focus.
 `posframe-hide' takes a buffer (not a frame) and manages the child-frame
 lifecycle correctly, avoiding orphaned frames."
+  ;; Remove guards FIRST so the parent-focus transfer below does not
+  ;; re-focus the soon-to-be-hidden posframe or block later normal
+  ;; display-buffer calls for popterm buffers.
+  (popterm--remove-focus-guard)
+  (popterm--remove-display-buffer-guard)
   (let ((parent (and (frame-live-p popterm--frame)
                      (frame-parent popterm--frame))))
     (when (buffer-live-p popterm--frame-buffer)

@@ -212,22 +212,29 @@ its navigation keys in ~vterm-keymap-exceptions~ at load time:
 This instructs libvterm to hand the key back to Emacs rather than forwarding it
 to the underlying PTY.
 
-*** How the Wayland Focus Race Is Solved
+*** How the Posframe Hidehandler Works
 
-The standard posframe hidehandler uses ~run-with-idle-timer~ and polls
-~(selected-frame)~. On Wayland/pgtk, focus transfer is asynchronous at the
-compositor level, meaning ~(selected-frame)~ can still return the parent frame
-during the idle callback immediately after a ~posframe-show~ call.
+~posframe~ ships with an idle-timer daemon (~posframe-hidehandler-daemon~) that
+fires every 0.5 s and calls each posframe's ~:hidehandler~ function.  When the
+handler returns non-nil, posframe hides that child frame automatically.
 
-~popterm~ bypasses this entirely by replacing the hidehandler with:
+~popterm~ provides ~popterm--posframe-hidehandler~, modelled after Centaur Emacs's
+~shell-pop-posframe-hidehandler~, which only returns non-nil (hide) when ALL of
+the following conditions are met:
 
-1. ~after-focus-change-function~ — an Emacs 27+ hook that fires *after* Emacs
-   has processed the actual compositor focus event, not on an idle poll.
-2. ~frame-focus-state~ — a pgtk-native function that queries the Wayland
-   compositor directly for the real focus state of a specific frame.
-3. A cancel-before-spawn inhibit timer (~popterm-posframe-focus-delay~ seconds)
-   stored in ~popterm--focus-timer~ to prevent ghost timers from rapid key-repeat
-   within the focus window.
+1. The focus-delay inhibit guard (~popterm--inhibit-hidehandler~) has expired.
+2. The posframe is still live and visible.
+3. The minibuffer is NOT active — guards standard minibuffer completion (M-x, etc.).
+4. The ~selected-frame~ is NOT a child frame — guards childframe completion UIs
+   such as ~vertico-posframe~, ~corfu-posframe~, or ~company-posframe~.
+5. The ~selected-frame~ is neither the popterm frame nor its parent — the parent
+   check ensures the posframe stays visible while the user is in their normal
+   workspace frame.
+
+The inhibit timer (~popterm-posframe-focus-delay~ seconds, stored in
+~popterm--focus-timer~) prevents the Wayland/pgtk async focus race: on these
+compositors, focus events can arrive before ~select-frame-set-input-focus~
+completes, causing the hidehandler to fire prematurely on rapid toggle.
 
 *** How PTY Initialization Artifacts Are Prevented
 
@@ -311,24 +318,19 @@ to survey all active instances at any time.
 
 see - https://github.com/tumashu/posframe/issues/155
 
-please use this work-around.
+This is now handled natively by ~popterm--posframe-hidehandler~.  The hidehandler
+checks three conditions that together prevent spurious hides when a completion
+child frame (vertico-posframe, corfu-posframe, etc.) opens while popterm is
+visible:
 
-#+BEGIN_SRC emacs-lisp
-  (with-eval-after-load 'popterm
-    (defun my/popterm--after-focus-change ()
-      "Keep popterm visible during minibuffer use and while parent frame is selected."
-      (let ((parent (and (frame-live-p popterm--frame)
-                         (frame-parent popterm--frame))))
-        (when (and (not popterm--inhibit-hidehandler)
-                   (popterm--posframe-visible-p)
-                   (not (active-minibuffer-window))
-                   (not (eq (selected-frame) parent))
-                   (not (popterm--posframe-focused-p)))
-          (popterm--posframe-hide))))
+- ~(active-minibuffer-window)~ — guards standard minibuffer completion.
+- ~(frame-parameter (selected-frame) 'parent-frame)~ — guards all child-frame UIs.
+- ~(memq (selected-frame) (list popterm--frame parent))~ — keeps the posframe
+  visible while the workspace frame or the popterm frame itself is focused.
 
-    (advice-add 'popterm--after-focus-change :override
-                #'my/popterm--after-focus-change))
-#+END_SRC
+No user-side workaround is needed.  If you had previously installed an advice
+override for ~popterm--after-focus-change~, you can safely remove it — that
+function no longer exists.
 
 
 

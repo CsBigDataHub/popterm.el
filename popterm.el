@@ -425,28 +425,37 @@ correct idioms for their respective backends."
 
 ;;; ── Posframe display ─────────────────────────────────────────────────────────
 
-(defun popterm--posframe-focused-p ()
-  "Return non-nil when the popterm posframe currently hold compositor focus.
-On pgtk (Wayland), `frame-focus-state' is used to query the actual
-compositor focus state rather than relying on `selected-frame', which
-can lag behind the real state due to async Wayland event dispatch."
-  (and (frame-live-p popterm--frame)
-       (if (fboundp 'frame-focus-state)
-           (frame-focus-state popterm--frame)
-         (eq (selected-frame) popterm--frame))))
+(defun popterm--posframe-hidehandler (_info)
+  "Hidehandler for posframe's idle-timer daemon.
+Called by `posframe-hidehandler-daemon-function' every 0.5s with INFO
+plist.  Returns non-nil to request posframe hide the child frame.
 
-(defun popterm--after-focus-change ()
-  "Hide the posframe when compositor focus leave the child frame.
-Attached to `after-focus-change-function' (Emacs 27+), which fires on
-real compositor-level focus events — unlike posframe's idle-timer
-hidehandler, which polls `selected-frame' and is unreliable on
-Wayland/pgtk where focus transfer is asynchronous.
+Modelled after Centaur Emacs's `shell-pop-posframe-hidehandler', this
+checks `selected-frame' against a whitelist of frames that should NOT
+trigger a hide:
+
+  1. The popterm child frame itself.
+  2. Its parent frame (the root/workspace frame).
+  3. Any other child frame (has a non-nil `parent-frame' parameter),
+     such as vertico-posframe, corfu-posframe, company-posframe, etc.
+
+Additionally, the minibuffer guard prevents hiding during standard
+minibuffer completion (M-x, C-x b, etc.) regardless of completion style.
+
 The `popterm--inhibit-hidehandler' guard prevents spurious hides during
-the `popterm-posframe-focus-delay' window immediately after a show."
-  (when (and (not popterm--inhibit-hidehandler)
-             (popterm--posframe-visible-p)
-             (not (popterm--posframe-focused-p)))
-    (popterm--posframe-hide)))
+the `popterm-posframe-focus-delay' window immediately after showing,
+addressing the Wayland/pgtk async focus race.
+
+Fixes posframe#155 and seagle0128/.emacs.d#482."
+  (let ((parent (and popterm--frame
+                     (frame-live-p popterm--frame)
+                     (frame-parent popterm--frame))))
+    (and (not popterm--inhibit-hidehandler)
+         (frame-live-p popterm--frame)
+         (frame-visible-p popterm--frame)
+         (not (active-minibuffer-window))
+         (not (frame-parameter (selected-frame) 'parent-frame))
+         (not (memq (selected-frame) (list popterm--frame parent))))))
 
 
 (defun popterm--posframe-show (buffer)
@@ -462,6 +471,7 @@ the `popterm-posframe-focus-delay' window immediately after a show."
              buffer
              :poshandler            (or popterm-posframe-poshandler
                                         #'posframe-poshandler-frame-center)
+             :hidehandler           #'popterm--posframe-hidehandler
              :left-fringe           8
              :right-fringe          8
              :width                 w
@@ -745,10 +755,12 @@ that is not currently shown."
 When enabled, Popterm installs lightweight hooks needed for best behavior:
 
 - Add `popterm--vterm-setup' to `vterm-mode-hook' so Popterm keys work in vterm.
-- Add `popterm--after-focus-change' to `after-focus-change-function' so posframe
-  hides reliably when focus leaves the child frame.
 - Add `popterm--on-buffer-kill' to `kill-buffer-hook' so Popterm cleans up its
   posframe/window if the active terminal buffer is killed.
+
+Posframe auto-hide is handled by posframe's own idle-timer daemon via the
+`:hidehandler' parameter passed to `posframe-show' — no global focus-change
+hook is needed.
 
 This mode is intentionally opt-in to avoid global side effects merely from
 loading the library (a common MELPA review requirement)."
@@ -757,11 +769,8 @@ loading the library (a common MELPA review requirement)."
   (if popterm-global-mode
       (progn
         (add-hook 'vterm-mode-hook #'popterm--vterm-setup)
-        (add-function :after after-focus-change-function
-          #'popterm--after-focus-change)
         (add-hook 'kill-buffer-hook #'popterm--on-buffer-kill))
     (remove-hook 'vterm-mode-hook #'popterm--vterm-setup)
-    (remove-function after-focus-change-function #'popterm--after-focus-change)
     (remove-hook 'kill-buffer-hook #'popterm--on-buffer-kill)))
 
 (provide 'popterm)

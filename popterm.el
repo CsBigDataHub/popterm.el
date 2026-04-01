@@ -233,9 +233,18 @@ to ORIG with BUFFER-OR-NAME unchanged."
         (popterm--cleanup-posframe-state))
       nil)))
 
-(with-eval-after-load 'posframe
-  (advice-add 'posframe--kill-buffer :around
-              #'popterm--preserve-buffer-during-posframe-delete))
+(defvar popterm--posframe-kill-buffer-advice-installed nil
+  "Non-nil once Popterm has advised `posframe--kill-buffer'.")
+
+(defun popterm--install-posframe-kill-buffer-advice ()
+  "Install Popterm's protection around `posframe--kill-buffer'."
+  (when (and (not popterm--posframe-kill-buffer-advice-installed)
+             (fboundp 'posframe--kill-buffer))
+    (setq popterm--posframe-kill-buffer-advice-installed t)
+    (advice-add 'posframe--kill-buffer :around
+                #'popterm--preserve-buffer-during-posframe-delete)))
+
+(popterm--install-posframe-kill-buffer-advice)
 
 ;;; ── Minor mode + vterm keymap passthrough ─────────────────────────────────────
 
@@ -586,11 +595,11 @@ The guard is *not* triggered when:
     (setq popterm--active-display-method nil)))
 
 (defun popterm--refresh-posframe-after-theme-change ()
-  "Refresh the active Popterm posframe after theme changes settle.
+  "Refresh the active Popterm posframe after theme change settle.
 
 This updates the live child frame's colors in place instead of
 re-showing the terminal buffer.  Re-showing a process-backed buffer such
-as `vterm' during theme transitions can trigger unwanted kill-buffer
+as `vterm' during theme transitions can trigger unwanted `kill-buffer'
 prompts."
   (setq popterm--theme-refresh-timer nil)
   (unwind-protect
@@ -619,7 +628,7 @@ prompts."
                           #'popterm--refresh-posframe-after-theme-change))))
 
 (defun popterm--install-theme-watch ()
-  "Watch theme changes while a Popterm posframe is active."
+  "Watch theme change while a Popterm posframe is active."
   (unless popterm--theme-watch-active
     (setq popterm--theme-watch-active t)
     (when (boundp 'enable-theme-functions)
@@ -628,7 +637,7 @@ prompts."
     (advice-add 'disable-theme :after #'popterm--queue-theme-refresh)))
 
 (defun popterm--remove-theme-watch ()
-  "Stop watching theme changes for Popterm posframes."
+  "Stop watching theme change for Popterm posframes."
   (when popterm--theme-watch-active
     (setq popterm--theme-watch-active nil)
     (when (boundp 'enable-theme-functions)
@@ -662,7 +671,7 @@ The `popterm--inhibit-hidehandler' guard prevents spurious hides during
 the `popterm-posframe-focus-delay' window immediately after showing,
 addressing the Wayland/pgtk async focus race.
 
-Fixes posframe#155 and seagle0128/.emacs.d#482."
+Fixes posframe#155 and Centaur Emacs issue #482."
   (let* ((frame popterm--frame)
          (parent (and frame
                       (frame-live-p frame)

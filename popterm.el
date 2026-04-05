@@ -209,13 +209,58 @@ posframe session is active.")
   "`display-buffer-alist' entry that blocks window redisplay of popterm buffers.")
 
 (defconst popterm--display-buffer-prefix "*popterm-"
-  "Buffer-name prefix used by Popterm buffers.")
+  "Canonical buffer-name prefix used when Popterm creates terminal buffers.")
 
-(defun popterm--buffer-p (&optional buffer-or-name)
-  "Return non-nil when BUFFER-OR-NAME is a Popterm buffer."
-  (when-let* ((buffer (get-buffer buffer-or-name))
-              (name (buffer-name buffer)))
-    (string-prefix-p popterm--display-buffer-prefix name)))
+(defvar-local popterm--managed-buffer nil
+  "Non-nil in buffers created and managed by Popterm.
+Backends such as Ghostel can rename their buffers after startup, so
+Popterm cannot rely solely on `buffer-name' to recognize its terminals.")
+
+(defvar-local popterm--buffer-backend nil
+  "Backend symbol associated with the current Popterm buffer.")
+
+(defvar-local popterm--buffer-instance-name nil
+  "Optional instance name associated with the current Popterm buffer.")
+
+(defun popterm--buffer-backend-p (buffer backend)
+  "Return non-nil when BUFFER belongs to BACKEND.
+Prefers Popterm's buffer-local metadata and falls back to the backend's
+major mode for buffers created before that metadata existed."
+  (with-current-buffer buffer
+    (or (eq popterm--buffer-backend backend)
+        (and (null popterm--buffer-backend)
+             (derived-mode-p (popterm--mode backend))))))
+
+(defun popterm--buffer-instance-matches-p (buffer name backend)
+  "Return non-nil when BUFFER matches instance NAME for BACKEND.
+Named instances use Popterm's buffer-local metadata when available so
+backend-driven renames (for example Ghostel titles) do not break lookup."
+  (and (popterm--buffer-p buffer backend)
+       (with-current-buffer buffer
+         (if (local-variable-p 'popterm--buffer-instance-name buffer)
+             (equal popterm--buffer-instance-name name)
+           (if name
+               (string= (buffer-name buffer) (popterm--buffer-name name backend))
+             (or popterm--managed-buffer
+                 (bound-and-true-p popterm-mode)))))))
+
+(defun popterm--buffer-p (&optional buffer-or-name backend)
+  "Return non-nil when BUFFER-OR-NAME is a Popterm buffer.
+When BACKEND is non-nil, also require that the buffer belongs to that
+backend.  Uses Popterm's buffer-local marker instead of depending only
+on the `*popterm-*' name prefix so title-renaming backends such as
+Ghostel remain discoverable."
+  (when-let* ((buffer (cond
+                       ((bufferp buffer-or-name) buffer-or-name)
+                       ((stringp buffer-or-name) (get-buffer buffer-or-name))
+                       (t nil))))
+    (with-current-buffer buffer
+      (and (or popterm--managed-buffer
+               (bound-and-true-p popterm-mode)
+               (string-prefix-p popterm--display-buffer-prefix
+                                (buffer-name buffer)))
+           (or (null backend)
+               (popterm--buffer-backend-p buffer backend))))))
 
 (defun popterm--preserve-buffer-during-posframe-delete (orig buffer-or-name)
   "Keep Popterm terminal buffers alive during external posframe cleanup.
@@ -405,6 +450,9 @@ window or disturb the current layout during creation."
       (error "Popterm: %s failed to create a buffer named %S — check that the backend is installed and functional"
              backend bname))
     (with-current-buffer buf
+      (setq-local popterm--managed-buffer t
+                  popterm--buffer-backend backend
+                  popterm--buffer-instance-name name)
       (popterm-mode 1))
     buf))
 
@@ -444,20 +492,16 @@ usable directory, or the project backend does not implement
 
 (defun popterm--buffer-list (&optional backend)
   "Return all live popterm buffers for BACKEND, filtered by `popterm-scope'."
-  (let* ((b      (or backend popterm-backend))
-         (mode   (popterm--mode b))
-         (frame  (selected-frame))
-         (root   (popterm--project-root))
-         (prefix (format "*popterm-%s" (symbol-name b))))
+  (let* ((b     (or backend popterm-backend))
+         (frame (selected-frame))
+         (root  (popterm--project-root)))
     (seq-filter
      (lambda (buf)
        (and (buffer-live-p buf)
-            (string-prefix-p prefix (buffer-name buf))
-            (with-current-buffer buf (derived-mode-p mode))
+            (popterm--buffer-p buf b)
             (pcase popterm-scope
               ('nil        t)
-              ('dedicated  (string= (buffer-name buf)
-                                    (popterm--buffer-name nil b)))
+              ('dedicated  (popterm--buffer-instance-matches-p buf nil b))
               ('frame      (popterm--not-in-other-frame frame buf))
               ('project    (and root
                                 (when-let ((dir (popterm--buffer-directory buf)))
@@ -472,9 +516,11 @@ Guards against a killed-but-not-yet-GC'd buffer by verifying
 `buffer-live-p' on any exact NAME match before returning it."
   (let* ((b     (or backend popterm-backend))
          (bufs  (popterm--buffer-list b))
-         (exact (let ((buf (and name
-                                (get-buffer (popterm--buffer-name name b)))))
-                  (and buf (buffer-live-p buf) buf))))
+         (exact (and name
+                     (seq-find (lambda (buf)
+                                 (and (buffer-live-p buf)
+                                      (popterm--buffer-instance-matches-p buf name b)))
+                               (buffer-list)))))
     (cond
      (exact exact)
      (bufs  (car bufs))
@@ -543,12 +589,10 @@ which prevents packages such as ECA or gptel from splitting a normal
 window to display the active posframe buffer."
   (and popterm--display-buffer-guard-active
        (popterm--posframe-visible-p)
-       (let* ((buf (if (bufferp buffer-or-name)
-                       buffer-or-name
-                     (get-buffer buffer-or-name)))
-              (name (and buf (buffer-name buf))))
-         (and name
-              (string-prefix-p popterm--display-buffer-prefix name)))))
+       (let ((buf (if (bufferp buffer-or-name)
+                      buffer-or-name
+                    (get-buffer buffer-or-name))))
+         (popterm--buffer-p buf))))
 
 (defun popterm--effective-display-method ()
   "Return the currently active Popterm display method."
@@ -1042,9 +1086,7 @@ Ignores `popterm-backend' setting."
 Searches all buffers regardless of `popterm-scope' — global navigator.
 Use `popterm-next'/`popterm-prev' for scope-aware cycling."
   (interactive)
-  (let ((bufs (seq-filter
-               (lambda (b) (string-prefix-p "*popterm-" (buffer-name b)))
-               (buffer-list))))
+  (let ((bufs (seq-filter #'popterm--buffer-p (buffer-list))))
     (if bufs
         (switch-to-buffer
          (completing-read "Popterm: " (mapcar #'buffer-name bufs) nil t))
@@ -1081,7 +1123,7 @@ the user is safely in their workspace; a message is sufficient."
   "Clean up frame/window ONLY when the actively displayed buffer is killed.
 Prevents collateral damage when a background process kills a terminal
 that is not currently shown."
-  (when (string-prefix-p "*popterm-" (buffer-name))
+  (when (popterm--buffer-p (current-buffer))
     (when (eq (current-buffer) popterm--frame-buffer)
       (popterm--posframe-hide))
     (when (and (window-live-p popterm--window)

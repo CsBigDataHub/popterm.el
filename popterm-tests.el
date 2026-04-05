@@ -79,6 +79,22 @@
       (popterm-ghostel "named")
       (should (equal called-args '("named" ghostel))))))
 
+(ert-deftest popterm-test-buffer-p-survives-ghostel-title-rename ()
+  "Test Popterm still recognizes a Ghostel buffer after title-based rename."
+  (let ((buffer (generate-new-buffer "*ghostel: host: ~/project*")))
+    (unwind-protect
+        (with-current-buffer buffer
+          (setq major-mode 'ghostel-mode)
+          (setq-local popterm--managed-buffer t
+                      popterm--buffer-backend 'ghostel
+                      popterm--buffer-instance-name nil)
+          (popterm-mode 1)
+          (should (popterm--buffer-p buffer))
+          (should (popterm--buffer-p buffer 'ghostel))
+          (should-not (popterm--buffer-p buffer 'vterm)))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 ;;; ── Directory and Path Tests ──────────────────────────────────────────────────
 
 (ert-deftest popterm-test-buffer-directory ()
@@ -199,6 +215,48 @@
                              bufs))
             (should-not (member other-buf bufs))))
       (mapc #'kill-buffer test-bufs))))
+
+(ert-deftest popterm-test-buffer-list-includes-renamed-ghostel-buffer ()
+  "Test renamed Ghostel Popterm buffers remain discoverable."
+  (let ((buffer (generate-new-buffer "*ghostel: host: ~/project*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (setq major-mode 'ghostel-mode)
+            (setq-local popterm--managed-buffer t
+                        popterm--buffer-backend 'ghostel
+                        popterm--buffer-instance-name nil)
+            (popterm-mode 1))
+          (cl-letf (((symbol-function 'buffer-list)
+                     (lambda () (list buffer))))
+            (should (equal (popterm--buffer-list 'ghostel)
+                           (list buffer)))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest popterm-test-get-or-create-reuses-renamed-named-ghostel-buffer ()
+  "Test named Ghostel buffers are reused even after backend title renames."
+  (let ((buffer (generate-new-buffer "*ghostel: host: ~/project*"))
+        (created-args nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (setq major-mode 'ghostel-mode)
+            (setq-local popterm--managed-buffer t
+                        popterm--buffer-backend 'ghostel
+                        popterm--buffer-instance-name "named")
+            (popterm-mode 1))
+          (cl-letf (((symbol-function 'buffer-list)
+                     (lambda () (list buffer)))
+                    ((symbol-function 'popterm--create)
+                     (lambda (&rest args)
+                       (setq created-args args)
+                       'unexpected-buffer)))
+            (should (eq (popterm--get-or-create "named" 'ghostel)
+                        buffer))
+            (should (null created-args))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
 
 (ert-deftest popterm-test-buffer-list-filters-dead-buffers ()
   "Test that dead buffers are filtered out of buffer list."
@@ -623,6 +681,16 @@
 
     (with-temp-buffer
       (rename-buffer "*popterm-eat[test]*" t)
+      (should (popterm--display-buffer-guard-p (current-buffer) nil)))
+
+    ;; Renamed Ghostel buffers should still be guarded via Popterm metadata
+    (with-temp-buffer
+      (rename-buffer "*ghostel: host: ~/project*" t)
+      (setq major-mode 'ghostel-mode)
+      (setq-local popterm--managed-buffer t
+                  popterm--buffer-backend 'ghostel
+                  popterm--buffer-instance-name nil)
+      (popterm-mode 1)
       (should (popterm--display-buffer-guard-p (current-buffer) nil)))
 
     ;; Non-popterm buffers should not be guarded

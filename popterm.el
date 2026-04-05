@@ -729,6 +729,8 @@ Fixes posframe#155 and Centaur Emacs issue #482."
                (not (active-minibuffer-window))
                (not (frame-parameter (selected-frame) 'parent-frame))
                (not (memq (selected-frame) (list frame parent))))))
+    ;; Only cleanup state if we're actually hiding the frame
+    ;; This prevents the hidehandler from clearing state when it decides NOT to hide
     (when should-hide
       (popterm--cleanup-posframe-state))
     should-hide))
@@ -803,6 +805,20 @@ Fixes posframe#155 and Centaur Emacs issue #482."
 lifecycle correctly, avoiding orphaned frames."
   (let ((frame popterm--frame)
         (buffer popterm--frame-buffer))
+    ;; If state variables are cleared but a child frame is still visible,
+    ;; find it so we can hide it properly
+    (unless (and frame buffer)
+      (ignore
+       (cl-some (lambda (f)
+                  (when (and (frame-live-p f)
+                             (frame-visible-p f)
+                             (frame-parameter f 'parent-frame))
+                    (let ((buf (window-buffer (frame-root-window f))))
+                      (when (popterm--buffer-p buf)
+                        (setq frame f
+                              buffer buf)
+                        t))))
+                (frame-list))))
     ;; Remove guards FIRST so the parent-focus transfer below does not
     ;; re-focus the soon-to-be-hidden posframe or block later normal
     ;; display-buffer calls for popterm buffers.
@@ -817,8 +833,17 @@ lifecycle correctly, avoiding orphaned frames."
 
 (defun popterm--posframe-visible-p ()
   "Non-nil when the posframe is live and visible."
-  (and (frame-live-p    popterm--frame)
-       (frame-visible-p popterm--frame)))
+  (or (and (frame-live-p    popterm--frame)
+           (frame-visible-p popterm--frame))
+      ;; Fallback: check if any child frame is showing a popterm buffer
+      ;; This handles cases where popterm--frame was cleared but the frame is still visible
+      (cl-some (lambda (f)
+                 (and (frame-live-p f)
+                      (frame-visible-p f)
+                      (frame-parameter f 'parent-frame)
+                      (let ((buf (window-buffer (frame-root-window f))))
+                        (popterm--buffer-p buf))))
+               (frame-list))))
 
 ;;; ── Window display ────────────────────────────────────────────────────────────
 

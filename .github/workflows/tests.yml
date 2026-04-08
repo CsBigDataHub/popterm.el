@@ -16,10 +16,11 @@ jobs:
           - "30.1"
 
     steps:
-      - uses: actions/checkout@v4
-
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
       - name: Set up Emacs
-        uses: purcell/setup-emacs@v6
+        uses: purcell/setup-emacs@bdc64dc730ae1fcba200bfd52cb1b4cf6159cbe5
         with:
           version: ${{ matrix.emacs_version }}
 

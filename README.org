@@ -3,6 +3,8 @@
 
 [[tests][https://github.com/CsBigDataHub/popterm.el/actions/workflows/tests.yml/badge.svg]]
 
+[[file:demo/Screencast_20260410_163941.webm][demo]]
+
 *A smart, posframe-based terminal toggler for Emacs.*
 
 ~popterm~ merges the best paradigms of modern Emacs terminal management into a

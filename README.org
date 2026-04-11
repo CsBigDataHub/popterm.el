@@ -5,6 +5,8 @@
 
 [[file:demo/Screencast_20260410_163941.mp4][demo]]
 
+[[file:demo/Screencast_20260410_163941-optimized.gif][gif]]
+
 *A smart, posframe-based terminal toggler for Emacs.*
 
 ~popterm~ merges the best paradigms of modern Emacs terminal management into a

@@ -40,7 +40,7 @@ layouts, asynchronous compositor events, and background processes.
 
 ** 📦 Installation
 
-~popterm~ requires Emacs 28.1+ and the [[https://github.com/tumashu/posframe][posframe]] package.
+~popterm~ requires Emacs 29.1+ and the [[https://github.com/tumashu/posframe][posframe]] package.
 
 *** straight.el / elpaca
 

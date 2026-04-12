@@ -358,6 +358,7 @@ current buffer.  `cl-pushnew' keeps the operation idempotent."
 (declare-function eshell-send-input "esh-mode" ())
 (declare-function ghostel "ghostel" ())
 (declare-function posframe-hide "posframe" (buffer-or-name))
+(declare-function posframe-poshandler-frame-center "posframe" (info))
 (declare-function posframe-show "posframe" (buffer-or-name &rest args))
 (declare-function shell "shell" (&optional buffer))
 (declare-function vterm "vterm" (&optional buffer-name))
@@ -590,7 +591,7 @@ correct idioms for their respective backends."
        ((derived-mode-p 'eshell-mode)
         (goto-char (point-max))
         (insert cmd)
-        (with-no-warnings (eshell-send-input)))))))
+        (eshell-send-input))))))
 
 ;;; ── Posframe focus guard ──────────────────────────────────────────────────────
 
@@ -811,25 +812,24 @@ Fixes posframe#155 and Centaur Emacs issue #482."
       (setq-local mode-line-format nil))
     (unwind-protect
         (setq frame
-              (with-no-warnings
-                (posframe-show
-                 buffer
-                 :poshandler (or popterm-posframe-poshandler
-                                 #'posframe-poshandler-frame-center)
-                 :hidehandler #'popterm--posframe-hidehandler
-                 :left-fringe 8
-                 :right-fringe 8
-                 :width w
-                 :height h
-                 :min-width w
-                 :min-height h
-                 :internal-border-width popterm-posframe-border-width
-                 :internal-border-color (face-background 'region nil t)
-                 :background-color (face-background 'default nil t)
-                 :foreground-color (face-foreground 'default nil t)
-                 :override-parameters '((cursor-type . t))
-                 :respect-mode-line nil
-                 :accept-focus t)))
+              (posframe-show
+               buffer
+               :poshandler (or popterm-posframe-poshandler
+                               #'posframe-poshandler-frame-center)
+               :hidehandler #'popterm--posframe-hidehandler
+               :left-fringe 8
+               :right-fringe 8
+               :width w
+               :height h
+               :min-width w
+               :min-height h
+               :internal-border-width popterm-posframe-border-width
+               :internal-border-color (face-background 'region nil t)
+               :background-color (face-background 'default nil t)
+               :foreground-color (face-foreground 'default nil t)
+               :override-parameters '((cursor-type . t))
+               :respect-mode-line nil
+               :accept-focus t))
       (unless frame
         (popterm--restore-posframe-buffer-state)))
     (setq popterm--frame frame)
@@ -884,8 +884,7 @@ lifecycle correctly, avoiding orphaned frames."
     (let ((parent (and (frame-live-p frame)
                        (frame-parent frame))))
       (when (buffer-live-p buffer)
-        (with-no-warnings
-          (posframe-hide buffer)))
+        (posframe-hide buffer))
       (when parent
         (select-frame-set-input-focus parent)))))
 

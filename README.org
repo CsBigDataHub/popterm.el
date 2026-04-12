@@ -3,6 +3,8 @@
 
 [[tests][https://github.com/CsBigDataHub/popterm.el/actions/workflows/tests.yml/badge.svg]]
 
+[[https://melpa.org/#/popterm][file:https://melpa.org/packages/popterm-badge.svg]]
+
 [[file:demo/Screencast_20260410_163941.mp4][demo]]
 
 [[file:demo/Screencast_20260410_163941-optimized.gif][gif]]
@@ -41,6 +43,21 @@ layouts, asynchronous compositor events, and background processes.
 ** 📦 Installation
 
 ~popterm~ requires Emacs 29.1+ and the [[https://github.com/tumashu/posframe][posframe]] package.
+
+*** Melpa
+
+#+BEGIN_SRC emacs-lisp
+  (use-package popterm
+    :bind (("C-`"   . popterm-toggle)
+           ("C-~"   . popterm-toggle-cd)
+           ([f9]    . popterm-window-toggle))
+    :config
+    (setq popterm-backend        'vterm     ; or 'ghostel, 'eat, 'shell, 'eshell
+          popterm-display-method 'posframe  ; or 'window, 'fullscreen
+          popterm-scope          'project   ; or 'frame, 'dedicated, nil
+          popterm-auto-cd        t)
+    (popterm-global-mode 1))
+#+END_SRC
 
 *** straight.el / elpaca
 

@@ -175,6 +175,7 @@ kept internal because it is only a narrow recovery path for that race.")
 (defvar popterm--frame-buffer nil "Buffer displayed in the active posframe.")
 (defvar popterm--window nil "Active window-split window.")
 (defvar popterm--source-buffer nil "Buffer active before the last toggle.")
+(defvar popterm--source-window nil "Window selected before the last toggle.")
 (defvar popterm--active-display-method nil
   "Display method currently used by the active Popterm session.")
 (defvar popterm--saved-mode-line-format nil
@@ -726,6 +727,19 @@ prompts."
         (redraw-frame popterm--frame))
     (setq popterm--inhibit-hidehandler nil)))
 
+(defun popterm--restore-parent-window-context (parent)
+  "Re-select the pre-popup window on PARENT when it is still live.
+
+On some Wayland compositors the frame regains keyboard focus before
+Emacs has reactivated a normal editing window, leaving the cursor drawn
+as inactive until the next navigation command.  Restoring the source
+window closes that gap."
+  (let ((window popterm--source-window))
+    (when (and (frame-live-p parent)
+               (window-live-p window)
+               (eq (window-frame window) parent))
+      (select-window window 'norecord))))
+
 (defun popterm--schedule-parent-focus-restore (parent)
   "Retry restoring focus to PARENT after posframe teardown on pgtk.
 
@@ -741,6 +755,7 @@ stealing focus if the posframe has already been re-opened."
      (lambda ()
        (when (and (frame-live-p parent)
                   (not (popterm--posframe-visible-p)))
+         (popterm--restore-parent-window-context parent)
          (select-frame-set-input-focus parent))))))
 
 (defun popterm--queue-theme-refresh (&rest _args)
@@ -910,6 +925,7 @@ lifecycle correctly, avoiding orphaned frames."
       ;; On Wayland/pgtk the compositor needs the child frame to remain
       ;; mapped while focus is being handed back to the parent.
       (when parent
+        (popterm--restore-parent-window-context parent)
         (select-frame-set-input-focus parent))
       (when (buffer-live-p buffer)
         (posframe-hide buffer))
@@ -1021,7 +1037,8 @@ the window-mode toggle from recreating rather than hiding the terminal."
       (popterm--hide)
     (unless (eq popterm-display-method 'window)
       (popterm--window-hide))
-    (setq popterm--source-buffer (current-buffer))
+    (setq popterm--source-buffer (current-buffer)
+          popterm--source-window (selected-window))
     (let ((buf (popterm--get-or-create name (or backend popterm-backend))))
       (popterm--show buf)
       (when popterm-auto-cd

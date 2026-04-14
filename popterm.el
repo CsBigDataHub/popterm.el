@@ -807,6 +807,37 @@ window closes that gap."
                (eq (window-frame window) parent))
       (select-window window 'norecord))))
 
+(defun popterm--pgtk-force-focus (frame)
+  "Force GTK to acknowledge keyboard focus on FRAME.
+
+On pgtk/Wayland, hiding a child frame can leave GTK's internal widget
+focus state desynchronized from the compositor: Emacs's Lisp-level
+`selected-frame' is correct but the GTK widget does not paint an active
+cursor and swallows keystrokes until a real GDK event arrives (e.g. an
+arrow key press).
+
+This function bridges that gap by:
+ 1. Raising the frame and making it visible — triggers GDK
+    configure/map events that can nudge GTK's focus tracking.
+ 2. Forcing a synchronous redisplay so GTK repaints the cursor
+    with the correct focused state.
+ 3. Sending a synthetic `focus-in' event through Emacs's event
+    loop, which runs `handle-focus-in' and updates the frame's
+    internal focus flag that controls cursor rendering."
+  (when (and (eq window-system 'pgtk)
+             (frame-live-p frame))
+    ;; 1. Raise + visible: nudge GDK to re-evaluate focus ownership.
+    (raise-frame frame)
+    (make-frame-visible frame)
+    ;; 2. Synchronous redisplay: flush any pending
+    ;;    frame-parameter changes to GTK before the event.
+    (redisplay t)
+    ;; 3. Synthetic focus-in: Emacs's event loop runs
+    ;;    `handle-focus-in' which sets the frame's
+    ;;    `focus' internal flag and triggers cursor repaint.
+    (let ((focus-event (list 'focus-in frame)))
+      (push focus-event unread-command-events))))
+
 (defun popterm--schedule-parent-focus-restore (parent)
   "Retry restoring focus to PARENT after posframe teardown on pgtk.
 
@@ -827,11 +858,7 @@ stealing focus if the posframe has already been re-opened."
                     (not (popterm--posframe-visible-p)))
            (popterm--restore-parent-window-context parent)
            (select-frame-set-input-focus parent)
-           ;; Synthetic focus-in: some pgtk compositors swallow the
-           ;; focus-change event when the child frame disappears.
-           ;; Force Emacs to re-enter focused state.
-           (when (fboundp 'x-focus-frame)
-             (x-focus-frame parent))
+           (popterm--pgtk-force-focus parent)
            (popterm--debug-log (format "RETRY@%.2f:refocused" delay))))))))
 
 (defun popterm--queue-theme-refresh (&rest _args)
@@ -1021,6 +1048,10 @@ lifecycle correctly, avoiding orphaned frames."
       (when (buffer-live-p buffer)
         (posframe-hide buffer))
       (popterm--debug-log "HIDE:after-posframe-hide")
+      ;; Force GTK to acknowledge focus on the parent frame.
+      ;; Without this, the cursor renders as inactive on pgtk/Wayland.
+      (when parent
+        (popterm--pgtk-force-focus parent))
       (popterm--schedule-parent-focus-restore parent))))
 
 (defun popterm--posframe-visible-p ()

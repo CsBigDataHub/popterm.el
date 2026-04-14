@@ -399,6 +399,14 @@ function no longer exists.
 | Auto-cd to source buffer       | ✅             | ✅             | ❌             |
 | TRAMP-aware auto-cd            | ✅             | ✅             | ❌             |
 
+** Known issues.
+
+- *PGTK emacs builds have a child frame focus issue*
+
+  please see [[https://github.com/CsBigDataHub/popterm.el/issues/1][#1]] and [[https://lists.gnu.org/archive/html/bug-gnu-emacs/2025-05/msg00972.html][Emacs bug#64625]]
+
+  I recommand using =lucid=, =x11= or =--with-x-toolkit=gtk3= emacs builds on linux
+
 ** 🧪 Testing
 
 ~popterm~ includes a comprehensive test suite using ERT (Emacs Lisp Regression Testing).

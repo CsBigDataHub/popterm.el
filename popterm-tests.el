@@ -34,6 +34,7 @@
 
 (defvar ghostel--process)
 (defvar popterm--source-window)
+(defvar popterm--pgtk-input-strategy-cache)
 (defvar vterm-keymap-exceptions)
 (defvar posframe--frame)
 

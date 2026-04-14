@@ -57,6 +57,7 @@
 (require 'cl-lib)
 (require 'seq)
 (require 'comint)
+(require 'subr-x)
 
 ;;; ── Customization ─────────────────────────────────────────────────────────────
 
@@ -156,6 +157,18 @@ Wayland/pgtk applies focus changes asynchronously, so the initial
 `select-frame-set-input-focus' call issued during posframe teardown may
 complete slightly after the child frame has been hidden.  This retry is
 kept internal because it is only a narrow recovery path for that race.")
+
+(defcustom popterm-pgtk-ydotool-socket nil
+  "Socket path used when invoking `ydotool' for the Wayland workaround.
+
+When nil, Popterm uses `YDOTOOL_SOCKET' from the current environment if
+present, otherwise it falls back to a detected common socket path such as
+`/tmp/.ydotool_socket' or `/run/user/UID/.ydotool_socket' when one
+exists.  Set this explicitly if your `ydotoold' service listens on a
+nonstandard socket."
+  :type '(choice (const :tag "Auto-detect" nil)
+                 (file :tag "Socket path"))
+  :group 'popterm)
 
 ;; ── Window split geometry ─────────────────────────────────────────────────────
 
@@ -262,6 +275,23 @@ timer from resetting the inhibit flag mid-flight on the next show cycle.")
 
 (defvar popterm--theme-refresh-timer nil
   "Debounce timer for re-showing the active posframe after a theme change.")
+
+(defvar popterm--pgtk-swallow-key-timer nil
+  "Timer that clears Popterm's temporary synthetic-key swallow map.")
+
+(defvar popterm--pgtk-swallow-key-previous-map nil
+  "Previous `overriding-terminal-local-map' saved before Popterm install.")
+
+(defconst popterm--pgtk-swallow-keymap
+  (let ((map (make-sparse-keymap)))
+    ;; Swallow arrow keys only.  These are used by the Wayland/pgtk
+    ;; focus workaround to wake GTK after child-frame teardown.  Keeping
+    ;; the map narrow ensures unrelated bindings (e.g. the user's next
+    ;; `s-f11') still resolve normally.
+    (dolist (key '("<up>" "<down>" "<left>" "<right>"))
+      (define-key map (kbd key) #'ignore))
+    map)
+  "Keymap used briefly to swallow Popterm's synthetic arrow-key event.")
 
 (defvar popterm--theme-watch-active nil
   "Non-nil while Popterm is watching theme changes for an active posframe.")
@@ -880,6 +910,36 @@ Returns a strategy keyword or nil."
   "Cached result of `popterm--pgtk-input-event-strategy'.
 Set on first use; cleared by `popterm--pgtk-reset-strategy-cache'.")
 
+(defun popterm--pgtk-ydotool-socket ()
+  "Return the socket path to use for `ydotool', or nil.
+Prefers `popterm-pgtk-ydotool-socket', then `YDOTOOL_SOCKET', then a
+small set of common daemon socket paths if they exist."
+  (or popterm-pgtk-ydotool-socket
+      (getenv "YDOTOOL_SOCKET")
+      (seq-find #'file-exists-p
+                (list "/tmp/.ydotool_socket"
+                      (format "/run/user/%s/.ydotool_socket" (user-uid))))))
+
+(defun popterm--run-external-command (program args &optional extra-env)
+  "Run PROGRAM with ARGS synchronously and capture its result.
+Return a plist with keys `:status' and `:output'.  `:status' is the exit
+status returned by the shell command; `:output' captures combined stdout
+and stderr.  EXTRA-ENV is a list of environment variable assignments
+strings added to `process-environment' for this invocation only."
+  (with-temp-buffer
+    (let* ((process-environment (append extra-env process-environment))
+           (command (mapconcat #'shell-quote-argument (cons program args) " "))
+           (status (call-process shell-file-name nil (list t nil) nil
+                                 shell-command-switch
+                                 (concat command " 2>&1")))
+           (output (string-trim (buffer-string))))
+      (list :status status :output output))))
+
+(defun popterm--external-command-success-p (result)
+  "Return non-nil when RESULT plist represents a successful process exit."
+  (let ((status (plist-get result :status)))
+    (and (integerp status) (zerop status))))
+
 (defun popterm--pgtk-reset-strategy-cache ()
   "Clear the cached input event strategy.
 Call this after installing ydotool or other tools."
@@ -895,6 +955,31 @@ Call this after installing ydotool or other tools."
   (and (not (eq popterm--pgtk-input-strategy-cache 'none))
        popterm--pgtk-input-strategy-cache))
 
+(defun popterm--pgtk-clear-synthetic-key-swallow ()
+  "Remove Popterm's temporary swallow map for synthetic arrow input."
+  (when (timerp popterm--pgtk-swallow-key-timer)
+    (cancel-timer popterm--pgtk-swallow-key-timer))
+  (setq popterm--pgtk-swallow-key-timer nil)
+  (when (eq overriding-terminal-local-map popterm--pgtk-swallow-keymap)
+    (setq overriding-terminal-local-map popterm--pgtk-swallow-key-previous-map))
+  (setq popterm--pgtk-swallow-key-previous-map nil))
+
+(defun popterm--pgtk-arm-synthetic-key-swallow ()
+  "Temporarily swallow Popterm's synthetic arrow key inside Emacs.
+
+The most reliable Wayland/pgtk wakeup event is a real arrow key, because
+physical arrow keys are known to trigger `pgtk_new_focus_frame' on the
+parent frame.  However, sending that key programmatically would normally
+move point.  To keep the workaround invisible to the user, install a
+short-lived `overriding-terminal-local-map' that binds arrow keys to
+`ignore', then clear it shortly after the synthetic event is sent."
+  (popterm--pgtk-clear-synthetic-key-swallow)
+  (setq popterm--pgtk-swallow-key-previous-map overriding-terminal-local-map
+        overriding-terminal-local-map popterm--pgtk-swallow-keymap
+        popterm--pgtk-swallow-key-timer
+        (run-with-timer 0.4 nil #'popterm--pgtk-clear-synthetic-key-swallow))
+  (popterm--debug-log "SYNTH-INPUT:swallow-armed"))
+
 (defun popterm--pgtk-synthesize-input-event ()
   "Inject a real input event to force GTK to re-evaluate focus state.
 
@@ -904,12 +989,12 @@ Lisp-level focus requests.  Only a real GDK event (arriving via the
 kernel input subsystem or compositor protocol) forces GTK to call
 `pgtk_new_focus_frame' on the parent frame.
 
-The synthesized event is a bare Shift_L press/release (evdev keycode
-42).  A modifier-only key is ideal because:
-  - It generates a real GDK key event that triggers focus handling.
-  - It produces no printable character.
-  - Emacs ignores bare modifier press/release in its command loop.
-  - It does not move the cursor or alter buffer contents.
+The synthesized event is an Up-arrow press/release rather than a bare
+modifier key.  The user's logs showed that a Shift event reached
+`ydotool' successfully but still did not reactivate keyboard input,
+whereas *physical arrow keys do*.  Popterm therefore injects the same
+class of event that is known to wake pgtk, and briefly swallows arrow
+keys in Emacs so the workaround does not move point.
 
 Returns non-nil if an event was successfully dispatched."
   (when (eq window-system 'pgtk)
@@ -918,15 +1003,34 @@ Returns non-nil if an event was successfully dispatched."
       (pcase strategy
         ('ydotool
          ;; ydotool works at kernel level via /dev/uinput.
-         ;; Keycode 42 = KEY_LEFTSHIFT in evdev.
-         ;; :1 = press, :0 = release.
+         ;; Keycode 103 = KEY_UP in evdev.  Run synchronously so we can
+         ;; verify the actual exit status rather than merely logging that
+         ;; the process was spawned.
          (condition-case err
-             (progn
-               (call-process "ydotool" nil 0 nil "key" "42:1" "42:0")
-               (popterm--debug-log "SYNTH-INPUT:ydotool-ok")
-               t)
+             (let* ((socket (popterm--pgtk-ydotool-socket))
+                    (env (when socket
+                           (list (format "YDOTOOL_SOCKET=%s" socket))))
+                    (result nil))
+               (popterm--pgtk-arm-synthetic-key-swallow)
+               (setq result
+                     (popterm--run-external-command
+                      "ydotool" '("key" "103:1" "103:0") env))
+               (if (popterm--external-command-success-p result)
+                   (progn
+                     (popterm--debug-log "SYNTH-INPUT:ydotool-ok"
+                                         'socket socket
+                                         'status (plist-get result :status)
+                                         'output (plist-get result :output))
+                     t)
+                 (popterm--pgtk-clear-synthetic-key-swallow)
+                 (popterm--debug-log "SYNTH-INPUT:ydotool-failed"
+                                     'socket socket
+                                     'status (plist-get result :status)
+                                     'output (plist-get result :output))
+                 nil))
            (error
-            (popterm--debug-log "SYNTH-INPUT:ydotool-failed" err)
+            (popterm--pgtk-clear-synthetic-key-swallow)
+            (popterm--debug-log "SYNTH-INPUT:ydotool-error" err)
             nil)))
         ('kde-dbus
          ;; Ask KWin to activate the Emacs window via D-Bus.
@@ -948,37 +1052,76 @@ Returns non-nil if an event was successfully dispatched."
         ('kdotool
          ;; kdotool uses kde-plasma-window-management Wayland protocol.
          (condition-case err
-             (let ((wid (popterm--pgtk-kdotool-find-emacs-window)))
+             (let ((wid (popterm--pgtk-kdotool-find-emacs-window))
+                   (result nil))
                (when wid
-                 (call-process "kdotool" nil 0 nil "windowactivate" wid)
-                 (popterm--debug-log "SYNTH-INPUT:kdotool-ok" 'wid wid)
-                 t))
+                 (setq result
+                       (popterm--run-external-command
+                        "kdotool" (list "windowactivate" wid)))
+                 (if (popterm--external-command-success-p result)
+                     (progn
+                       (popterm--debug-log "SYNTH-INPUT:kdotool-ok"
+                                           'wid wid
+                                           'status (plist-get result :status)
+                                           'output (plist-get result :output))
+                       t)
+                   (popterm--debug-log "SYNTH-INPUT:kdotool-failed"
+                                       'wid wid
+                                       'status (plist-get result :status)
+                                       'output (plist-get result :output))
+                   nil)))
            (error
-            (popterm--debug-log "SYNTH-INPUT:kdotool-failed" err)
+            (popterm--debug-log "SYNTH-INPUT:kdotool-error" err)
             nil)))
         ('dotool
          ;; dotool writes to /dev/uinput, similar to ydotool.
          ;; It reads commands from stdin.
          (condition-case err
-             (progn
+             (let ((result nil))
+               (popterm--pgtk-arm-synthetic-key-swallow)
                (with-temp-buffer
-                 (insert "key shift\n")
-                 (call-process-region (point-min) (point-max) "dotool" nil 0))
-               (popterm--debug-log "SYNTH-INPUT:dotool-ok")
-               t)
+                 (insert "key up\n")
+                 (let ((status (call-process-region (point-min) (point-max)
+                                                    "dotool" nil (list t nil))))
+                   (setq result (list :status status
+                                      :output (string-trim (buffer-string))))))
+               (if (popterm--external-command-success-p result)
+                   (progn
+                     (popterm--debug-log "SYNTH-INPUT:dotool-ok"
+                                         'status (plist-get result :status)
+                                         'output (plist-get result :output))
+                     t)
+                 (popterm--pgtk-clear-synthetic-key-swallow)
+                 (popterm--debug-log "SYNTH-INPUT:dotool-failed"
+                                     'status (plist-get result :status)
+                                     'output (plist-get result :output))
+                 nil))
            (error
-            (popterm--debug-log "SYNTH-INPUT:dotool-failed" err)
+            (popterm--pgtk-clear-synthetic-key-swallow)
+            (popterm--debug-log "SYNTH-INPUT:dotool-error" err)
             nil)))
         ('wtype
          ;; wtype simulates keystrokes on Wayland (wlroots compositors).
-         ;; -P = press, -p = release.  Shift_L is the key name.
          (condition-case err
-             (progn
-               (call-process "wtype" nil 0 nil "-P" "Shift_L" "-p" "Shift_L")
-               (popterm--debug-log "SYNTH-INPUT:wtype-ok")
-               t)
+             (let ((result nil))
+               (popterm--pgtk-arm-synthetic-key-swallow)
+               (setq result
+                     (popterm--run-external-command
+                      "wtype" '("-P" "Up" "-p" "Up")))
+               (if (popterm--external-command-success-p result)
+                   (progn
+                     (popterm--debug-log "SYNTH-INPUT:wtype-ok"
+                                         'status (plist-get result :status)
+                                         'output (plist-get result :output))
+                     t)
+                 (popterm--pgtk-clear-synthetic-key-swallow)
+                 (popterm--debug-log "SYNTH-INPUT:wtype-failed"
+                                     'status (plist-get result :status)
+                                     'output (plist-get result :output))
+                 nil))
            (error
-            (popterm--debug-log "SYNTH-INPUT:wtype-failed" err)
+            (popterm--pgtk-clear-synthetic-key-swallow)
+            (popterm--debug-log "SYNTH-INPUT:wtype-error" err)
             nil)))
         (_ nil)))))
 

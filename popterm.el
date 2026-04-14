@@ -842,7 +842,7 @@ window closes that gap."
       (select-window window 'norecord))))
 
 (defun popterm--pgtk-force-focus (frame)
-  "Force GTK to acknowledge keyboard focus on FRAME.
+  "Issue the least-invasive pgtk focus nudge for FRAME.
 
 On pgtk/Wayland, hiding or destroying a child frame can leave GTK's
 internal widget focus state desynchronized from the compositor: Emacs's
@@ -850,24 +850,19 @@ Lisp-level `selected-frame' is correct but the GTK widget does not
 paint an active cursor and swallows keystrokes until a real GDK event
 arrives (e.g. an arrow key press).
 
-This function bridges that gap by:
- 1. Calling `x-focus-frame' to issue a Wayland focus request directly
-    through the pgtk backend, bypassing the higher-level
-    `select-frame-set-input-focus' wrapper.
- 2. Raising the frame and making it visible — triggers GDK
-    configure/map events that can nudge GTK's focus tracking.
- 3. Forcing a synchronous redisplay so GTK repaints the cursor
-    with the correct focused state."
+Historically Popterm also called `raise-frame' and `make-frame-visible'
+here, but the user's latest KDE logs show the synthetic input wakeup now
+works while the parent frame sometimes resizes unexpectedly.  Those more
+aggressive frame operations are the likeliest trigger for compositor
+reconfigure/resize side effects, so this helper is intentionally kept to
+only the minimal focus request plus redisplay flush."
   (when (and (eq window-system 'pgtk)
              (frame-live-p frame))
-    ;; 1. Direct X-level focus request to the Wayland compositor.
+    ;; Direct pgtk focus request to the compositor.
     (when (fboundp 'x-focus-frame)
       (x-focus-frame frame))
-    ;; 2. Raise + visible: nudge GDK to re-evaluate focus ownership.
-    (raise-frame frame)
-    (make-frame-visible frame)
-    ;; 3. Synchronous redisplay: flush any pending
-    ;;    frame-parameter changes to GTK.
+    ;; Flush any pending visual updates without requesting window-manager
+    ;; reconfiguration of the parent frame.
     (redisplay t)))
 
 (defun popterm--pgtk-input-event-strategy ()
@@ -1179,28 +1174,35 @@ On later retries (≥ 0.1s), this also invokes
 `popterm--pgtk-synthesize-input-event' which injects a real kernel/
 compositor-level event to work around Emacs bug#64625.  The pgtk
 backend fails to call `pgtk_new_focus_frame' after child frame
-deletion; only a genuine GDK input event forces that code path."
+deletion; only a genuine GDK input event forces that code path.
+
+To avoid compositor-side resize/reconfigure side effects, the extra
+`popterm--pgtk-force-focus' nudge is only used before a synthetic-input
+strategy is available.  Once Popterm can inject a real wakeup event,
+plain `select-frame-set-input-focus' plus that event is sufficient."
   (when (and (frame-live-p parent)
              (eq window-system 'pgtk))
-    (dolist (delay '(0.05 0.15 0.3))
-      (run-with-timer
-       delay nil
-       (lambda ()
-         (popterm--debug-log (format "RETRY@%.2f:enter" delay)
-                             'posframe-visible (popterm--posframe-visible-p))
-         (when (and (frame-live-p parent)
-                    (not (popterm--posframe-visible-p)))
-           (popterm--restore-parent-window-context parent)
-           (select-frame-set-input-focus parent)
-           (popterm--pgtk-force-focus parent)
-           ;; On later retries, synthesize a real input event to
-           ;; work around bug#64625.  The child frame is fully
-           ;; destroyed by now, so the compositor has had time to
-           ;; process the surface unmapping.  The injected event
-           ;; forces GTK to call pgtk_new_focus_frame on the parent.
-           (when (>= delay 0.1)
-             (popterm--pgtk-synthesize-input-event))
-           (popterm--debug-log (format "RETRY@%.2f:refocused" delay))))))))
+    (let ((has-input-strategy (popterm--pgtk-get-strategy)))
+      (dolist (delay '(0.05 0.15 0.3))
+        (run-with-timer
+         delay nil
+         (lambda ()
+           (popterm--debug-log (format "RETRY@%.2f:enter" delay)
+                               'posframe-visible (popterm--posframe-visible-p))
+           (when (and (frame-live-p parent)
+                      (not (popterm--posframe-visible-p)))
+             (popterm--restore-parent-window-context parent)
+             (select-frame-set-input-focus parent)
+             (unless has-input-strategy
+               (popterm--pgtk-force-focus parent))
+             ;; On later retries, synthesize a real input event to
+             ;; work around bug#64625.  The child frame is fully
+             ;; destroyed by now, so the compositor has had time to
+             ;; process the surface unmapping.  The injected event
+             ;; forces GTK to call pgtk_new_focus_frame on the parent.
+             (when (>= delay 0.1)
+               (popterm--pgtk-synthesize-input-event))
+             (popterm--debug-log (format "RETRY@%.2f:refocused" delay)))))))))
 
 (defun popterm--queue-theme-refresh (&rest _args)
   "Debounce Popterm posframe refresh during theme transitions."
@@ -1410,17 +1412,20 @@ On X11 and macOS, `posframe-hide' is used as before."
           ;; On X11/macOS: just hide — no focus issue.
           (posframe-hide buffer)
           (popterm--debug-log "HIDE:after-posframe-hide")))
-      ;; Force GTK to acknowledge focus on the parent frame.
-      (when parent
-        (popterm--pgtk-force-focus parent))
-      (popterm--schedule-parent-focus-restore parent)
-      ;; Warn once if no input-event strategy is available on pgtk.
-      (when (and use-delete
-                 (not (popterm--pgtk-get-strategy))
-                 (not (get 'popterm--pgtk-warned 'warned)))
-        (put 'popterm--pgtk-warned 'warned t)
-        (message "popterm: pgtk/Wayland focus bug detected (Emacs bug#64625). \
-Install ydotool for automatic workaround, or press an arrow key to restore focus.")))))
+      (let ((has-input-strategy (and use-delete (popterm--pgtk-get-strategy))))
+        ;; Keep the immediate post-delete path minimal when we can inject a
+        ;; real wakeup event ourselves; aggressive frame nudges are the most
+        ;; likely source of the resize regression seen on KDE Wayland.
+        (when (and parent (not has-input-strategy))
+          (popterm--pgtk-force-focus parent))
+        (popterm--schedule-parent-focus-restore parent)
+        ;; Warn once if no input-event strategy is available on pgtk.
+        (when (and use-delete
+                   (not has-input-strategy)
+                   (not (get 'popterm--pgtk-warned 'warned)))
+          (put 'popterm--pgtk-warned 'warned t)
+          (message "popterm: pgtk/Wayland focus bug detected (Emacs bug#64625). \
+Install ydotool for automatic workaround, or press an arrow key to restore focus."))))))
 
 (defun popterm--posframe-visible-p ()
   "Non-nil when the posframe is live and visible."

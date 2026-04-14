@@ -432,6 +432,7 @@ current buffer.  `cl-pushnew' keeps the operation idempotent."
 (declare-function eshell "esh-mode" (&optional arg))
 (declare-function eshell-send-input "esh-mode" ())
 (declare-function ghostel "ghostel" ())
+(declare-function posframe-delete "posframe" (buffer-or-name))
 (declare-function posframe-hide "posframe" (buffer-or-name))
 (declare-function posframe-poshandler-frame-center "posframe" (info))
 (declare-function posframe-show "posframe" (buffer-or-name &rest args))
@@ -810,33 +811,31 @@ window closes that gap."
 (defun popterm--pgtk-force-focus (frame)
   "Force GTK to acknowledge keyboard focus on FRAME.
 
-On pgtk/Wayland, hiding a child frame can leave GTK's internal widget
-focus state desynchronized from the compositor: Emacs's Lisp-level
-`selected-frame' is correct but the GTK widget does not paint an active
-cursor and swallows keystrokes until a real GDK event arrives (e.g. an
-arrow key press).
+On pgtk/Wayland, hiding or destroying a child frame can leave GTK's
+internal widget focus state desynchronized from the compositor: Emacs's
+Lisp-level `selected-frame' is correct but the GTK widget does not
+paint an active cursor and swallows keystrokes until a real GDK event
+arrives (e.g. an arrow key press).
 
 This function bridges that gap by:
- 1. Raising the frame and making it visible — triggers GDK
+ 1. Calling `x-focus-frame' to issue a Wayland focus request directly
+    through the pgtk backend, bypassing the higher-level
+    `select-frame-set-input-focus' wrapper.
+ 2. Raising the frame and making it visible — triggers GDK
     configure/map events that can nudge GTK's focus tracking.
- 2. Forcing a synchronous redisplay so GTK repaints the cursor
-    with the correct focused state.
- 3. Sending a synthetic `focus-in' event through Emacs's event
-    loop, which runs `handle-focus-in' and updates the frame's
-    internal focus flag that controls cursor rendering."
+ 3. Forcing a synchronous redisplay so GTK repaints the cursor
+    with the correct focused state."
   (when (and (eq window-system 'pgtk)
              (frame-live-p frame))
-    ;; 1. Raise + visible: nudge GDK to re-evaluate focus ownership.
+    ;; 1. Direct X-level focus request to the Wayland compositor.
+    (when (fboundp 'x-focus-frame)
+      (x-focus-frame frame))
+    ;; 2. Raise + visible: nudge GDK to re-evaluate focus ownership.
     (raise-frame frame)
     (make-frame-visible frame)
-    ;; 2. Synchronous redisplay: flush any pending
-    ;;    frame-parameter changes to GTK before the event.
-    (redisplay t)
-    ;; 3. Synthetic focus-in: Emacs's event loop runs
-    ;;    `handle-focus-in' which sets the frame's
-    ;;    `focus' internal flag and triggers cursor repaint.
-    (let ((focus-event (list 'focus-in frame)))
-      (push focus-event unread-command-events))))
+    ;; 3. Synchronous redisplay: flush any pending
+    ;;    frame-parameter changes to GTK.
+    (redisplay t)))
 
 (defun popterm--schedule-parent-focus-restore (parent)
   "Retry restoring focus to PARENT after posframe teardown on pgtk.
@@ -1007,9 +1006,21 @@ Fixes posframe#155 and Centaur Emacs issue #482."
     (popterm--debug-log "SHOW:exit")))
 
 (defun popterm--posframe-hide ()
-  "Hide the posframe via posframe's native API and restore parent focus.
-`posframe-hide' takes a buffer (not a frame) and manages the child-frame
-lifecycle correctly, avoiding orphaned frames."
+  "Hide the posframe and restore parent focus.
+
+On pgtk/Wayland, `posframe-hide' only calls `make-frame-invisible' which
+leaves the Wayland surface in the compositor's internal focus chain.
+KDE 6 Wayland does not properly reassign keyboard focus to the parent
+GTK window after that operation, resulting in an inactive cursor and
+swallowed keystrokes.
+
+To work around this, on pgtk we use `posframe-delete' which fully
+destroys the child frame, forcing the compositor to release its keyboard
+grab.  The terminal buffer is preserved alive by the
+`popterm--preserve-buffer-during-posframe-delete' advice; posframe will
+recreate the child frame on the next `posframe-show' call.
+
+On X11 and macOS, `posframe-hide' is used as before."
   (let ((frame popterm--frame)
         (buffer popterm--frame-buffer))
     ;; If state variables are cleared but a child frame is still visible,
@@ -1033,7 +1044,8 @@ lifecycle correctly, avoiding orphaned frames."
     (popterm--cleanup-posframe-state)
     (popterm--debug-log "HIDE:after-cleanup")
     (let ((parent (and (frame-live-p frame)
-                       (frame-parent frame))))
+                       (frame-parent frame)))
+          (use-delete (eq window-system 'pgtk)))
       ;; On Wayland/pgtk the compositor needs the child frame to remain
       ;; mapped while focus is being handed back to the parent.  Redirect
       ;; the child frame's keystrokes first so Emacs no longer treats the
@@ -1046,10 +1058,17 @@ lifecycle correctly, avoiding orphaned frames."
         (select-frame-set-input-focus parent)
         (popterm--debug-log "HIDE:after-select-frame-set-input-focus"))
       (when (buffer-live-p buffer)
-        (posframe-hide buffer))
-      (popterm--debug-log "HIDE:after-posframe-hide")
+        (if use-delete
+            ;; On pgtk/Wayland: destroy the child frame entirely so the
+            ;; compositor must release keyboard focus from the surface.
+            ;; The buffer is preserved by our posframe--kill-buffer advice.
+            (progn
+              (posframe-delete buffer)
+              (popterm--debug-log "HIDE:after-posframe-delete"))
+          ;; On X11/macOS: just hide — no focus issue.
+          (posframe-hide buffer)
+          (popterm--debug-log "HIDE:after-posframe-hide")))
       ;; Force GTK to acknowledge focus on the parent frame.
-      ;; Without this, the cursor renders as inactive on pgtk/Wayland.
       (when parent
         (popterm--pgtk-force-focus parent))
       (popterm--schedule-parent-focus-restore parent))))

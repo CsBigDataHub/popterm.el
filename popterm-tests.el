@@ -500,6 +500,9 @@
                     ((symbol-function 'posframe-hide)
                      (lambda (buf)
                        (push (list 'hide buf) events)))
+                    ((symbol-function 'posframe-delete)
+                     (lambda (buf)
+                       (push (list 'delete buf) events)))
                     ((symbol-function 'popterm--pgtk-force-focus)
                      (lambda (frame)
                        (push (list 'gtk-focus frame) events)))
@@ -507,14 +510,80 @@
                      (lambda (frame)
                        (push (list 'retry frame) events))))
             (popterm--posframe-hide)
-            (should (equal (nreverse events)
-                           (list 'cleanup
-                                 (list 'redirect 'child 'parent)
-                                 (list 'window 'parent)
-                                 (list 'focus 'parent)
-                                 (list 'hide buffer)
-                                 (list 'gtk-focus 'parent)
-                                 (list 'retry 'parent))))))
+            (let* ((ordered (nreverse events))
+                   ;; The hide/delete step depends on window-system
+                   (teardown-event (if (eq window-system 'pgtk)
+                                       (list 'delete buffer)
+                                     (list 'hide buffer))))
+              ;; Core ordering: cleanup → redirect → window → focus → hide/delete
+              (should (equal ordered
+                             (list 'cleanup
+                                   (list 'redirect 'child 'parent)
+                                   (list 'window 'parent)
+                                   (list 'focus 'parent)
+                                   teardown-event
+                                   (list 'gtk-focus 'parent)
+                                   (list 'retry 'parent)))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest popterm-test-posframe-hide-uses-delete-on-pgtk ()
+  "Verify posframe teardown uses `posframe-delete' on pgtk/Wayland."
+  (let ((buffer (get-buffer-create "*popterm-hide-pgtk*"))
+        (popterm--frame 'child)
+        (popterm--frame-buffer nil)
+        (window-system 'pgtk)
+        (deleted nil)
+        (hidden nil))
+    (unwind-protect
+        (progn
+          (setq popterm--frame-buffer buffer)
+          (cl-letf (((symbol-function 'popterm--cleanup-posframe-state) #'ignore)
+                    ((symbol-function 'frame-live-p) (lambda (_frame) t))
+                    ((symbol-function 'frame-parent) (lambda (_frame) 'parent))
+                    ((symbol-function 'redirect-frame-focus) #'ignore)
+                    ((symbol-function 'popterm--restore-parent-window-context) #'ignore)
+                    ((symbol-function 'select-frame-set-input-focus) #'ignore)
+                    ((symbol-function 'posframe-delete)
+                     (lambda (buf) (setq deleted buf)))
+                    ((symbol-function 'posframe-hide)
+                     (lambda (buf) (setq hidden buf)))
+                    ((symbol-function 'popterm--pgtk-force-focus) #'ignore)
+                    ((symbol-function 'popterm--schedule-parent-focus-restore) #'ignore))
+            (popterm--posframe-hide)
+            ;; On pgtk, posframe-delete should be called, not posframe-hide
+            (should (eq deleted buffer))
+            (should-not hidden)))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest popterm-test-posframe-hide-uses-hide-on-non-pgtk ()
+  "Verify posframe teardown uses `posframe-hide' on X11/macOS."
+  (let ((buffer (get-buffer-create "*popterm-hide-x11*"))
+        (popterm--frame 'child)
+        (popterm--frame-buffer nil)
+        (window-system 'x)
+        (deleted nil)
+        (hidden nil))
+    (unwind-protect
+        (progn
+          (setq popterm--frame-buffer buffer)
+          (cl-letf (((symbol-function 'popterm--cleanup-posframe-state) #'ignore)
+                    ((symbol-function 'frame-live-p) (lambda (_frame) t))
+                    ((symbol-function 'frame-parent) (lambda (_frame) 'parent))
+                    ((symbol-function 'redirect-frame-focus) #'ignore)
+                    ((symbol-function 'popterm--restore-parent-window-context) #'ignore)
+                    ((symbol-function 'select-frame-set-input-focus) #'ignore)
+                    ((symbol-function 'posframe-delete)
+                     (lambda (buf) (setq deleted buf)))
+                    ((symbol-function 'posframe-hide)
+                     (lambda (buf) (setq hidden buf)))
+                    ((symbol-function 'popterm--pgtk-force-focus) #'ignore)
+                    ((symbol-function 'popterm--schedule-parent-focus-restore) #'ignore))
+            (popterm--posframe-hide)
+            ;; On non-pgtk, posframe-hide should be called, not posframe-delete
+            (should (eq hidden buffer))
+            (should-not deleted)))
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 

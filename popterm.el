@@ -872,6 +872,11 @@ Fixes posframe#155 and Centaur Emacs issue #482."
       (unless frame
         (popterm--restore-posframe-buffer-state)))
     (setq popterm--frame frame)
+    ;; Clear any focus redirection left from the previous hide cycle.
+    ;; `redirect-frame-focus' persists until reset, and posframe may reuse
+    ;; the same child frame object across show/hide operations.
+    (when (frame-live-p popterm--frame)
+      (redirect-frame-focus popterm--frame nil))
     ;; Inhibit the hidehandler during the focus-transfer window.
     ;; Cancel any in-flight timer first: rapid key-repeat within the delay
     ;; window would otherwise spawn multiple timers, and the earliest would
@@ -923,8 +928,11 @@ lifecycle correctly, avoiding orphaned frames."
     (let ((parent (and (frame-live-p frame)
                        (frame-parent frame))))
       ;; On Wayland/pgtk the compositor needs the child frame to remain
-      ;; mapped while focus is being handed back to the parent.
-      (when parent
+      ;; mapped while focus is being handed back to the parent.  Redirect
+      ;; the child frame's keystrokes first so Emacs no longer treats the
+      ;; child as the effective event target during teardown.
+      (when (and parent (frame-live-p frame))
+        (redirect-frame-focus frame parent)
         (popterm--restore-parent-window-context parent)
         (select-frame-set-input-focus parent))
       (when (buffer-live-p buffer)

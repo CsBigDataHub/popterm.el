@@ -28,6 +28,7 @@
 (declare-function popterm--schedule-parent-focus-restore "popterm" (parent))
 
 (defvar ghostel--process)
+(defvar popterm--source-window)
 (defvar vterm-keymap-exceptions)
 (defvar posframe--frame)
 
@@ -424,7 +425,8 @@
 (ert-deftest popterm-test-posframe-show-hides-mode-line ()
   "Verify posframe display suppresses the buffer mode line."
   (let ((buffer (get-buffer-create "*popterm-modeline*"))
-        (captured-args nil))
+        (captured-args nil)
+        (redirected nil))
     (unwind-protect
         (progn
           (with-current-buffer buffer
@@ -435,6 +437,10 @@
                      (lambda (&rest args)
                        (setq captured-args args)
                        'fake-frame))
+                    ((symbol-function 'frame-live-p) (lambda (_frame) t))
+                    ((symbol-function 'redirect-frame-focus)
+                     (lambda (frame target)
+                       (setq redirected (list frame target))))
                     ((symbol-function 'select-frame-set-input-focus) #'ignore)
                     ((symbol-function 'run-with-timer)
                      (lambda (&rest _args) 'fake-timer))
@@ -445,6 +451,7 @@
             (with-current-buffer buffer
               (should (null mode-line-format)))
             (should (equal popterm--saved-mode-line-format '(" Demo")))
+            (should (equal redirected '(fake-frame nil)))
             (should (equal (plist-get (cdr captured-args) :respect-mode-line)
                            nil))))
       (when (buffer-live-p buffer)
@@ -468,7 +475,7 @@
       (should (null popterm--focus-timer)))))
 
 (ert-deftest popterm-test-posframe-hide-focuses-parent-before-hide ()
-  "Verify posframe teardown restores window context before hiding the child."
+  "Verify posframe teardown redirects focus before hiding the child."
   (let ((buffer (get-buffer-create "*popterm-hide-order*"))
         (popterm--frame 'child)
         (popterm--frame-buffer nil)
@@ -480,6 +487,9 @@
                      (lambda () (push 'cleanup events)))
                     ((symbol-function 'frame-live-p) (lambda (_frame) t))
                     ((symbol-function 'frame-parent) (lambda (_frame) 'parent))
+                    ((symbol-function 'redirect-frame-focus)
+                     (lambda (frame target)
+                       (push (list 'redirect frame target) events)))
                     ((symbol-function 'popterm--restore-parent-window-context)
                      (lambda (frame)
                        (push (list 'window frame) events)))
@@ -495,6 +505,7 @@
             (popterm--posframe-hide)
             (should (equal (nreverse events)
                            (list 'cleanup
+                                 (list 'redirect 'child 'parent)
                                  (list 'window 'parent)
                                  (list 'focus 'parent)
                                  (list 'hide buffer)

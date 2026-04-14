@@ -171,6 +171,13 @@ kept internal because it is only a narrow recovery path for that race.")
 
 ;;; ── Internal state ────────────────────────────────────────────────────────────
 
+(defvar popterm--debug nil
+  "Non-nil enables verbose teardown logging to *Messages*.
+Set to t before reproducing focus issues, then inspect *Messages*.")
+
+(defvar popterm--debug-focus-observer-installed nil
+  "Non-nil while Popterm's debug focus observer is installed.")
+
 (defvar popterm--frame nil "Active posframe child frame.")
 (defvar popterm--frame-buffer nil "Buffer displayed in the active posframe.")
 (defvar popterm--window nil "Active window-split window.")
@@ -178,6 +185,66 @@ kept internal because it is only a narrow recovery path for that race.")
 (defvar popterm--source-window nil "Window selected before the last toggle.")
 (defvar popterm--active-display-method nil
   "Display method currently used by the active Popterm session.")
+
+(defun popterm--debug-log (stage &rest args)
+  "Log STAGE with ARGS to *Messages* when `popterm--debug' is non-nil.
+Each entry captures: selected-frame, selected-window, frame-focus of
+the parent and child frames, frame-visible-p, and window-system."
+  (when popterm--debug
+    (let* ((sf (selected-frame))
+           (sw (selected-window))
+           (child popterm--frame)
+           (parent (and (frame-live-p sf)
+                        (or (frame-parent sf)
+                            (unless (frame-parameter sf 'parent-frame) sf))))
+           (child-focus (and (frame-live-p child)
+                             (frame-focus child)))
+           (parent-focus (and (frame-live-p parent)
+                              (frame-focus parent)))
+           (child-vis (and (frame-live-p child)
+                           (frame-visible-p child)))
+           (parent-vis (and (frame-live-p parent)
+                            (frame-visible-p parent))))
+      (message "POPTERM-DEBUG [%s] %s | sel-frame=%s sel-win=%s child=%s(%s,focus→%s) parent=%s(%s,focus→%s) src-win=%s ws=%s"
+               stage
+               (if args (mapconcat #'prin1-to-string args " ") "")
+               sf sw
+               child (if child-vis "vis" "hid") child-focus
+               parent (if parent-vis "vis" "hid") parent-focus
+               popterm--source-window
+               window-system))))
+
+(defun popterm--debug-focus-observer ()
+  "Log every focus change when `popterm--debug' is non-nil."
+  (when popterm--debug
+    (let ((sf (selected-frame)))
+      (message "POPTERM-DEBUG [FOCUS-CHANGE] sel-frame=%s parent-frame=%s frame-focus=%s visible=%s"
+               sf
+               (frame-parameter sf 'parent-frame)
+               (frame-focus sf)
+               (frame-visible-p sf)))))
+
+(defun popterm-debug-start ()
+  "Enable Popterm debug logging.
+Installs a focus-change observer and sets `popterm--debug' to t."
+  (interactive)
+  (setq popterm--debug t)
+  (unless popterm--debug-focus-observer-installed
+    (setq popterm--debug-focus-observer-installed t)
+    (add-function :after after-focus-change-function
+                  #'popterm--debug-focus-observer))
+  (message "Popterm debug logging ENABLED.  Reproduce the issue, then M-x popterm-debug-stop"))
+
+(defun popterm-debug-stop ()
+  "Disable Popterm debug logging and remove the focus observer."
+  (interactive)
+  (setq popterm--debug nil)
+  (when popterm--debug-focus-observer-installed
+    (setq popterm--debug-focus-observer-installed nil)
+    (remove-function after-focus-change-function
+                     #'popterm--debug-focus-observer))
+  (message "Popterm debug logging DISABLED."))
+
 (defvar popterm--saved-mode-line-format nil
   "Original `mode-line-format' for the active posframe buffer.")
 (defvar popterm--inhibit-hidehandler nil
@@ -746,17 +813,26 @@ window closes that gap."
 Wayland compositors apply keyboard-focus changes asynchronously.  When
 Popterm hands focus back to the parent frame during child-frame teardown,
 the initial request may still be in flight when `posframe-hide' unmaps
-the child.  Retrying shortly afterwards recovers that rare race without
+the child.  Retrying at several intervals recovers that race without
 stealing focus if the posframe has already been re-opened."
   (when (and (frame-live-p parent)
              (eq window-system 'pgtk))
-    (run-with-timer
-     popterm--posframe-parent-focus-retry-delay nil
-     (lambda ()
-       (when (and (frame-live-p parent)
-                  (not (popterm--posframe-visible-p)))
-         (popterm--restore-parent-window-context parent)
-         (select-frame-set-input-focus parent))))))
+    (dolist (delay '(0.05 0.15 0.3))
+      (run-with-timer
+       delay nil
+       (lambda ()
+         (popterm--debug-log (format "RETRY@%.2f:enter" delay)
+                             'posframe-visible (popterm--posframe-visible-p))
+         (when (and (frame-live-p parent)
+                    (not (popterm--posframe-visible-p)))
+           (popterm--restore-parent-window-context parent)
+           (select-frame-set-input-focus parent)
+           ;; Synthetic focus-in: some pgtk compositors swallow the
+           ;; focus-change event when the child frame disappears.
+           ;; Force Emacs to re-enter focused state.
+           (when (fboundp 'x-focus-frame)
+             (x-focus-frame parent))
+           (popterm--debug-log (format "RETRY@%.2f:refocused" delay))))))))
 
 (defun popterm--queue-theme-refresh (&rest _args)
   "Debounce Popterm posframe refresh during theme transitions."
@@ -837,6 +913,7 @@ Fixes posframe#155 and Centaur Emacs issue #482."
   "Show BUFFER in a centered posframe child frame."
   (require 'posframe)
   (popterm--install-posframe-kill-buffer-advice)
+  (popterm--debug-log "SHOW:enter" 'buffer buffer)
   (let* ((w (max popterm-posframe-min-width
                  (round (* (frame-width) popterm-posframe-width-ratio))))
          (h (round (* (frame-height) popterm-posframe-height-ratio)))
@@ -899,7 +976,8 @@ Fixes posframe#155 and Centaur Emacs issue #482."
     ;; cannot re-display popterm buffers in regular split windows.
     (popterm--install-display-buffer-guard)
     (popterm--install-focus-guard)
-    (popterm--install-theme-watch)))
+    (popterm--install-theme-watch)
+    (popterm--debug-log "SHOW:exit")))
 
 (defun popterm--posframe-hide ()
   "Hide the posframe via posframe's native API and restore parent focus.
@@ -921,10 +999,12 @@ lifecycle correctly, avoiding orphaned frames."
                               buffer buf)
                         t))))
                 (frame-list))))
+    (popterm--debug-log "HIDE:enter" 'frame frame 'buffer buffer)
     ;; Remove guards FIRST so the parent-focus transfer below does not
     ;; re-focus the soon-to-be-hidden posframe or block later normal
     ;; display-buffer calls for popterm buffers.
     (popterm--cleanup-posframe-state)
+    (popterm--debug-log "HIDE:after-cleanup")
     (let ((parent (and (frame-live-p frame)
                        (frame-parent frame))))
       ;; On Wayland/pgtk the compositor needs the child frame to remain
@@ -933,10 +1013,14 @@ lifecycle correctly, avoiding orphaned frames."
       ;; child as the effective event target during teardown.
       (when (and parent (frame-live-p frame))
         (redirect-frame-focus frame parent)
+        (popterm--debug-log "HIDE:after-redirect")
         (popterm--restore-parent-window-context parent)
-        (select-frame-set-input-focus parent))
+        (popterm--debug-log "HIDE:after-restore-window")
+        (select-frame-set-input-focus parent)
+        (popterm--debug-log "HIDE:after-select-frame-set-input-focus"))
       (when (buffer-live-p buffer)
         (posframe-hide buffer))
+      (popterm--debug-log "HIDE:after-posframe-hide")
       (popterm--schedule-parent-focus-restore parent))))
 
 (defun popterm--posframe-visible-p ()
@@ -1041,6 +1125,9 @@ Optional NAME selects a named instance; optional BACKEND overrides
 `popterm-backend'.  Visibility is checked BEFORE any cleanup to prevent
 the window-mode toggle from recreating rather than hiding the terminal."
   (interactive)
+  (popterm--debug-log "TOGGLE:enter" 'visible (popterm--visible-p)
+                      'last-input last-input-event
+                      'this-command this-command)
   (if (popterm--visible-p)
       (popterm--hide)
     (unless (eq popterm-display-method 'window)
@@ -1050,7 +1137,8 @@ the window-mode toggle from recreating rather than hiding the terminal."
     (let ((buf (popterm--get-or-create name (or backend popterm-backend))))
       (popterm--show buf)
       (when popterm-auto-cd
-        (popterm--send-cd buf popterm--source-buffer)))))
+        (popterm--send-cd buf popterm--source-buffer))))
+  (popterm--debug-log "TOGGLE:exit"))
 
 ;;;###autoload
 (defun popterm-toggle-cd (&optional name backend)

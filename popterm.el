@@ -150,6 +150,13 @@ on a slow compositor."
   :type 'float
   :group 'popterm)
 
+(defconst popterm--posframe-parent-focus-retry-delay 0.05
+  "Seconds to wait before retrying parent-frame focus after hiding.
+Wayland/pgtk applies focus changes asynchronously, so the initial
+`select-frame-set-input-focus' call issued during posframe teardown may
+complete slightly after the child frame has been hidden.  This retry is
+kept internal because it is only a narrow recovery path for that race.")
+
 ;; ── Window split geometry ─────────────────────────────────────────────────────
 
 (defcustom popterm-window-height-ratio 0.30
@@ -719,6 +726,23 @@ prompts."
         (redraw-frame popterm--frame))
     (setq popterm--inhibit-hidehandler nil)))
 
+(defun popterm--schedule-parent-focus-restore (parent)
+  "Retry restoring focus to PARENT after posframe teardown on pgtk.
+
+Wayland compositors apply keyboard-focus changes asynchronously.  When
+Popterm hands focus back to the parent frame during child-frame teardown,
+the initial request may still be in flight when `posframe-hide' unmaps
+the child.  Retrying shortly afterwards recovers that rare race without
+stealing focus if the posframe has already been re-opened."
+  (when (and (frame-live-p parent)
+             (eq window-system 'pgtk))
+    (run-with-timer
+     popterm--posframe-parent-focus-retry-delay nil
+     (lambda ()
+       (when (and (frame-live-p parent)
+                  (not (popterm--posframe-visible-p)))
+         (select-frame-set-input-focus parent))))))
+
 (defun popterm--queue-theme-refresh (&rest _args)
   "Debounce Popterm posframe refresh during theme transitions."
   (when (and popterm--theme-watch-active
@@ -883,10 +907,13 @@ lifecycle correctly, avoiding orphaned frames."
     (popterm--cleanup-posframe-state)
     (let ((parent (and (frame-live-p frame)
                        (frame-parent frame))))
+      ;; On Wayland/pgtk the compositor needs the child frame to remain
+      ;; mapped while focus is being handed back to the parent.
+      (when parent
+        (select-frame-set-input-focus parent))
       (when (buffer-live-p buffer)
         (posframe-hide buffer))
-      (when parent
-        (select-frame-set-input-focus parent)))))
+      (popterm--schedule-parent-focus-restore parent))))
 
 (defun popterm--posframe-visible-p ()
   "Non-nil when the posframe is live and visible."

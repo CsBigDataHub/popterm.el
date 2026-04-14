@@ -86,14 +86,15 @@ Clone the repository and add the directory to your ~load-path~:
 
 *** Dependencies
 
-| Package    | Required? | Purpose                               |
-|------------+-----------+---------------------------------------|
-| ~posframe~ | Required  | Child-frame rendering                 |
-| ~vterm~    | Optional  | vterm backend                         |
-| ~ghostel~  | Optional  | Ghostel backend (requires its module) |
-| ~eat~      | Optional  | eat backend                           |
-| ~project~  | Built-in  | Project-scoped buffer resolution      |
-| ~tramp~    | Built-in  | Remote path stripping for auto-cd     |
+| Package    | Required? | Purpose                                      |
+|------------+-----------+----------------------------------------------|
+| ~posframe~ | Required  | Child-frame rendering                        |
+| ~vterm~    | Optional  | vterm backend                                |
+| ~ghostel~  | Optional  | Ghostel backend (requires its module)        |
+| ~eat~      | Optional  | eat backend                                  |
+| ~project~  | Built-in  | Project-scoped buffer resolution             |
+| ~tramp~    | Built-in  | Remote path stripping for auto-cd            |
+| ~ydotool~  | Optional  | Wayland focus workaround (system tool, pgtk) |
 
 ** 🚀 Usage
 
@@ -314,6 +315,46 @@ You are likely on Wayland/pgtk. Increase the focus delay guard:
 
 #+BEGIN_SRC emacs-lisp
 (setq popterm-posframe-focus-delay 0.5)
+#+END_SRC
+
+*** Keyboard focus lost after closing posframe on Wayland (pgtk)
+
+On Wayland compositors (KDE Plasma, GNOME, Sway, etc.) with Emacs built using
+the pgtk backend, hiding the posframe child frame can leave the parent frame's
+keyboard focus in a stale state: the cursor appears but keystrokes are
+swallowed until you press an arrow key.  This is caused by [[https://debbugs.gnu.org/cgi/bugreport.cgi?bug=64625][Emacs bug#64625]] — a
+pgtk-specific issue where ~pgtk_new_focus_frame~ is not called after a child
+frame is destroyed.
+
+*Automatic workaround:* Popterm detects pgtk and probes for tools that can
+inject a real input event to force GTK out of its stale state.  Install one of
+the following (listed in order of preference):
+
+| Tool       | Level             | Scope                | Install                                         |
+|------------+-------------------+----------------------+-------------------------------------------------|
+| ~ydotool~  | Kernel (uinput)   | All Wayland          | ~sudo apt install ydotool~ or ~yay -S ydotool~  |
+| ~kdotool~  | KDE Wayland proto | KDE Plasma only      | ~pip install kdotool~ or ~yay -S kdotool~       |
+| ~dotool~   | Kernel (uinput)   | All Wayland          | ~go install git.sr.ht/~geb/dotool@latest~       |
+| ~wtype~    | wlroots protocol  | wlroots compositors  | ~sudo apt install wtype~                         |
+
+Popterm also tries KDE's D-Bus interface (~org.kde.KWin~) when available.
+
+After installing a tool, refresh the detection cache:
+
+#+BEGIN_SRC emacs-lisp
+M-x popterm--pgtk-reset-strategy-cache
+#+END_SRC
+
+For ~ydotool~, you may also need to start the ~ydotoold~ daemon or add your user
+to the ~input~ group (varies by distribution and ydotool version):
+
+#+BEGIN_SRC bash
+# ydotool 0.x requires the daemon:
+sudo systemctl enable --now ydotoold
+
+# ydotool 1.x requires /dev/uinput access:
+sudo usermod -aG input $USER
+# (log out and back in)
 #+END_SRC
 
 *** ~C-q~ / ~C-<next>~ not working inside vterm

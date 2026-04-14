@@ -27,6 +27,10 @@
 (declare-function popterm--restore-parent-window-context "popterm" (parent))
 (declare-function popterm--schedule-parent-focus-restore "popterm" (parent))
 (declare-function popterm--pgtk-force-focus "popterm" (frame))
+(declare-function popterm--pgtk-input-event-strategy "popterm" ())
+(declare-function popterm--pgtk-get-strategy "popterm" ())
+(declare-function popterm--pgtk-reset-strategy-cache "popterm" ())
+(declare-function popterm--pgtk-synthesize-input-event "popterm" ())
 
 (defvar ghostel--process)
 (defvar popterm--source-window)
@@ -931,6 +935,76 @@
 
       ;; Cleanup
       (mapc #'kill-buffer test-buffers))))
+
+;;; ── pgtk/Wayland focus workaround tests ────────────────────────────────────
+
+(ert-deftest popterm-test-pgtk-input-strategy-detection ()
+  "Test that `popterm--pgtk-input-event-strategy' returns a known strategy or nil."
+  (let ((popterm--pgtk-input-strategy-cache nil))
+    ;; The function should return a known symbol or nil depending on
+    ;; what tools are installed on the test system.
+    (let ((result (popterm--pgtk-input-event-strategy)))
+      (should (or (null result)
+                  (memq result '(ydotool kde-dbus kdotool dotool wtype)))))))
+
+(ert-deftest popterm-test-pgtk-strategy-caching ()
+  "Test that `popterm--pgtk-get-strategy' caches its result."
+  (let ((popterm--pgtk-input-strategy-cache nil))
+    ;; First call populates the cache.
+    (popterm--pgtk-get-strategy)
+    (should (not (null popterm--pgtk-input-strategy-cache)))
+    ;; Second call reuses the cache (symbol should be same).
+    (let ((cached popterm--pgtk-input-strategy-cache))
+      (popterm--pgtk-get-strategy)
+      (should (eq cached popterm--pgtk-input-strategy-cache)))))
+
+(ert-deftest popterm-test-pgtk-reset-strategy-cache ()
+  "Test that `popterm--pgtk-reset-strategy-cache' clears the cache."
+  (let ((popterm--pgtk-input-strategy-cache 'ydotool))
+    (popterm--pgtk-reset-strategy-cache)
+    (should (null popterm--pgtk-input-strategy-cache))))
+
+(ert-deftest popterm-test-pgtk-synthesize-noop-on-non-pgtk ()
+  "Test that `popterm--pgtk-synthesize-input-event' is a no-op on non-pgtk."
+  ;; On macOS/X11 (window-system is not 'pgtk), should return nil.
+  (unless (eq window-system 'pgtk)
+    (should (null (popterm--pgtk-synthesize-input-event)))))
+
+(ert-deftest popterm-test-pgtk-force-focus-noop-on-non-pgtk ()
+  "Test that `popterm--pgtk-force-focus' is a no-op on non-pgtk."
+  (unless (eq window-system 'pgtk)
+    ;; Should not error, just silently do nothing.
+    (popterm--pgtk-force-focus (selected-frame))
+    (should t)))
+
+(ert-deftest popterm-test-pgtk-schedule-calls-synthesize ()
+  "Test that retry timers include synthesized input on pgtk."
+  (let ((window-system 'pgtk)
+        (synth-called nil)
+        (timers-created nil))
+    (cl-letf (((symbol-function 'popterm--pgtk-synthesize-input-event)
+               (lambda () (setq synth-called t) t))
+              ((symbol-function 'popterm--pgtk-force-focus)
+               #'ignore)
+              ((symbol-function 'popterm--restore-parent-window-context)
+               #'ignore)
+              ((symbol-function 'select-frame-set-input-focus)
+               #'ignore)
+              ((symbol-function 'popterm--posframe-visible-p)
+               (lambda () nil))
+              ((symbol-function 'popterm--debug-log)
+               #'ignore)
+              ((symbol-function 'run-with-timer)
+               (lambda (delay _repeat fn)
+                 (push (cons delay fn) timers-created))))
+      (popterm--schedule-parent-focus-restore (selected-frame))
+      ;; Should have created 3 retry timers.
+      (should (= 3 (length timers-created)))
+      ;; Run the 0.15s timer callback — should call synthesize.
+      (let ((timer-015 (cdr (cl-find 0.15 timers-created :key #'car))))
+        (when timer-015
+          (funcall timer-015)
+          (should synth-called))))))
 
 ;;; ── Test Summary ──────────────────────────────────────────────────────────────
 

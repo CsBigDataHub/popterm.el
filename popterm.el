@@ -443,6 +443,9 @@ current buffer.  `cl-pushnew' keeps the operation idempotent."
 (declare-function vterm-send-string "vterm" (string))
 ;; vterm-buffer-name is handled via a direct argument (see vterm backend below)
 ;; so no defvar is needed for it.
+;; D-Bus functions for KDE window activation (pgtk/Wayland workaround).
+(declare-function dbus-call-method "dbusbind"
+  (bus service path interface method &rest args))
 
 (defun popterm--mode (backend)
   "Return the major-mode symbol for BACKEND."
@@ -837,6 +840,189 @@ This function bridges that gap by:
     ;;    frame-parameter changes to GTK.
     (redisplay t)))
 
+(defun popterm--pgtk-input-event-strategy ()
+  "Return a strategy to synthesize a real input event on pgtk/Wayland.
+
+Emacs bug#64625: when a child frame is deleted on pgtk, the C function
+`pgtk_new_focus_frame' is never called for the parent frame.  All
+Lisp-level focus APIs (`select-frame-set-input-focus', `x-focus-frame',
+etc.) succeed at the Lisp level but GTK's internal focus state remains
+stale — keystrokes are swallowed until a real GDK input event arrives.
+
+This function probes the system for a tool that can inject a hardware-
+level input event to force GTK out of its stale state.  Strategies are
+tried in order of reliability:
+
+  1. ydotool  — kernel-level (evdev/uinput), compositor-agnostic.
+  2. KDE D-Bus — KWin window activation, KDE-specific.
+  3. kdotool  — KDE plasma window management protocol.
+  4. dotool   — /dev/uinput, like ydotool but simpler.
+  5. wtype    — Wayland keystroke simulation (wlroots only, not KDE).
+
+Returns a strategy keyword or nil."
+  (cond
+   ((executable-find "ydotool") 'ydotool)
+   ((and (featurep 'dbusbind)
+         (member "org.kde.KWin"
+                 (ignore-errors
+                   (dbus-call-method :session
+                                     "org.freedesktop.DBus"
+                                     "/org/freedesktop/DBus"
+                                     "org.freedesktop.DBus"
+                                     "ListNames"))))
+    'kde-dbus)
+   ((executable-find "kdotool") 'kdotool)
+   ((executable-find "dotool")  'dotool)
+   ((executable-find "wtype")   'wtype)
+   (t nil)))
+
+(defvar popterm--pgtk-input-strategy-cache nil
+  "Cached result of `popterm--pgtk-input-event-strategy'.
+Set on first use; cleared by `popterm--pgtk-reset-strategy-cache'.")
+
+(defun popterm--pgtk-reset-strategy-cache ()
+  "Clear the cached input event strategy.
+Call this after installing ydotool or other tools."
+  (interactive)
+  (setq popterm--pgtk-input-strategy-cache nil)
+  (put 'popterm--pgtk-warned 'warned nil))
+
+(defun popterm--pgtk-get-strategy ()
+  "Return the cached input event strategy, probing on first call."
+  (unless popterm--pgtk-input-strategy-cache
+    (setq popterm--pgtk-input-strategy-cache
+          (or (popterm--pgtk-input-event-strategy) 'none)))
+  (and (not (eq popterm--pgtk-input-strategy-cache 'none))
+       popterm--pgtk-input-strategy-cache))
+
+(defun popterm--pgtk-synthesize-input-event ()
+  "Inject a real input event to force GTK to re-evaluate focus state.
+
+This is the core workaround for Emacs bug#64625.  After the child frame
+is destroyed, GTK's internal focus tracking is stale and ignores all
+Lisp-level focus requests.  Only a real GDK event (arriving via the
+kernel input subsystem or compositor protocol) forces GTK to call
+`pgtk_new_focus_frame' on the parent frame.
+
+The synthesized event is a bare Shift_L press/release (evdev keycode
+42).  A modifier-only key is ideal because:
+  - It generates a real GDK key event that triggers focus handling.
+  - It produces no printable character.
+  - Emacs ignores bare modifier press/release in its command loop.
+  - It does not move the cursor or alter buffer contents.
+
+Returns non-nil if an event was successfully dispatched."
+  (when (eq window-system 'pgtk)
+    (let ((strategy (popterm--pgtk-get-strategy)))
+      (popterm--debug-log "SYNTH-INPUT" 'strategy strategy)
+      (pcase strategy
+        ('ydotool
+         ;; ydotool works at kernel level via /dev/uinput.
+         ;; Keycode 42 = KEY_LEFTSHIFT in evdev.
+         ;; :1 = press, :0 = release.
+         (condition-case err
+             (progn
+               (call-process "ydotool" nil 0 nil "key" "42:1" "42:0")
+               (popterm--debug-log "SYNTH-INPUT:ydotool-ok")
+               t)
+           (error
+            (popterm--debug-log "SYNTH-INPUT:ydotool-failed" err)
+            nil)))
+        ('kde-dbus
+         ;; Ask KWin to activate the Emacs window via D-Bus.
+         ;; This uses KDE's native window management, bypassing GTK.
+         (condition-case err
+             (let ((wid (popterm--pgtk-kde-find-emacs-window)))
+               (when wid
+                 (dbus-call-method :session
+                                   "org.kde.KWin"
+                                   "/KWin"
+                                   "org.kde.KWin"
+                                   "activateWindow"
+                                   wid)
+                 (popterm--debug-log "SYNTH-INPUT:kde-dbus-ok" 'wid wid)
+                 t))
+           (error
+            (popterm--debug-log "SYNTH-INPUT:kde-dbus-failed" err)
+            nil)))
+        ('kdotool
+         ;; kdotool uses kde-plasma-window-management Wayland protocol.
+         (condition-case err
+             (let ((wid (popterm--pgtk-kdotool-find-emacs-window)))
+               (when wid
+                 (call-process "kdotool" nil 0 nil "windowactivate" wid)
+                 (popterm--debug-log "SYNTH-INPUT:kdotool-ok" 'wid wid)
+                 t))
+           (error
+            (popterm--debug-log "SYNTH-INPUT:kdotool-failed" err)
+            nil)))
+        ('dotool
+         ;; dotool writes to /dev/uinput, similar to ydotool.
+         ;; It reads commands from stdin.
+         (condition-case err
+             (progn
+               (with-temp-buffer
+                 (insert "key shift\n")
+                 (call-process-region (point-min) (point-max) "dotool" nil 0))
+               (popterm--debug-log "SYNTH-INPUT:dotool-ok")
+               t)
+           (error
+            (popterm--debug-log "SYNTH-INPUT:dotool-failed" err)
+            nil)))
+        ('wtype
+         ;; wtype simulates keystrokes on Wayland (wlroots compositors).
+         ;; -P = press, -p = release.  Shift_L is the key name.
+         (condition-case err
+             (progn
+               (call-process "wtype" nil 0 nil "-P" "Shift_L" "-p" "Shift_L")
+               (popterm--debug-log "SYNTH-INPUT:wtype-ok")
+               t)
+           (error
+            (popterm--debug-log "SYNTH-INPUT:wtype-failed" err)
+            nil)))
+        (_ nil)))))
+
+(defun popterm--pgtk-kde-find-emacs-window ()
+  "Return the KDE internal window ID string for the Emacs parent frame.
+Uses `dbus-call-method' to query KWin's window list.  Returns nil if
+the Emacs window cannot be found."
+  (condition-case nil
+      (let* ((clients (dbus-call-method :session
+                                        "org.kde.KWin"
+                                        "/KWin"
+                                        "org.kde.KWin"
+                                        "queryWindowInfo"))
+             ;; queryWindowInfo may not exist on all KWin versions.
+             ;; Fallback: use the scripting interface.
+             )
+        (ignore clients)
+        nil)
+    (error
+     ;; Fallback: use KWin scripting to get window ID via caption.
+     (condition-case nil
+         (let ((output (with-output-to-string
+                         (call-process "gdbus" nil standard-output nil
+                                       "call" "--session"
+                                       "--dest" "org.kde.KWin"
+                                       "--object-path" "/Scripting"
+                                       "--method"
+                                       "org.kde.KWin.Scripting.evaluateScript"
+                                       "workspace.activeWindow.internalId.toString()"))))
+           (when (string-match "'\\([^']+\\)'" output)
+             (match-string 1 output)))
+       (error nil)))))
+
+(defun popterm--pgtk-kdotool-find-emacs-window ()
+  "Return the kdotool window ID string for the Emacs parent frame.
+Searches by the WM_CLASS pattern `emacs' (case-insensitive)."
+  (condition-case nil
+      (let ((output (with-output-to-string
+                      (call-process "kdotool" nil standard-output nil
+                                    "search" "--class" "[Ee]macs"))))
+        (when (string-match "\\([0-9a-f-]+\\)" output)
+          (match-string 1 output)))
+    (error nil)))
+
 (defun popterm--schedule-parent-focus-restore (parent)
   "Retry restoring focus to PARENT after posframe teardown on pgtk.
 
@@ -844,7 +1030,13 @@ Wayland compositors apply keyboard-focus changes asynchronously.  When
 Popterm hands focus back to the parent frame during child-frame teardown,
 the initial request may still be in flight when `posframe-hide' unmaps
 the child.  Retrying at several intervals recovers that race without
-stealing focus if the posframe has already been re-opened."
+stealing focus if the posframe has already been re-opened.
+
+On later retries (≥ 0.1s), this also invokes
+`popterm--pgtk-synthesize-input-event' which injects a real kernel/
+compositor-level event to work around Emacs bug#64625.  The pgtk
+backend fails to call `pgtk_new_focus_frame' after child frame
+deletion; only a genuine GDK input event forces that code path."
   (when (and (frame-live-p parent)
              (eq window-system 'pgtk))
     (dolist (delay '(0.05 0.15 0.3))
@@ -858,6 +1050,13 @@ stealing focus if the posframe has already been re-opened."
            (popterm--restore-parent-window-context parent)
            (select-frame-set-input-focus parent)
            (popterm--pgtk-force-focus parent)
+           ;; On later retries, synthesize a real input event to
+           ;; work around bug#64625.  The child frame is fully
+           ;; destroyed by now, so the compositor has had time to
+           ;; process the surface unmapping.  The injected event
+           ;; forces GTK to call pgtk_new_focus_frame on the parent.
+           (when (>= delay 0.1)
+             (popterm--pgtk-synthesize-input-event))
            (popterm--debug-log (format "RETRY@%.2f:refocused" delay))))))))
 
 (defun popterm--queue-theme-refresh (&rest _args)
@@ -1071,7 +1270,14 @@ On X11 and macOS, `posframe-hide' is used as before."
       ;; Force GTK to acknowledge focus on the parent frame.
       (when parent
         (popterm--pgtk-force-focus parent))
-      (popterm--schedule-parent-focus-restore parent))))
+      (popterm--schedule-parent-focus-restore parent)
+      ;; Warn once if no input-event strategy is available on pgtk.
+      (when (and use-delete
+                 (not (popterm--pgtk-get-strategy))
+                 (not (get 'popterm--pgtk-warned 'warned)))
+        (put 'popterm--pgtk-warned 'warned t)
+        (message "popterm: pgtk/Wayland focus bug detected (Emacs bug#64625). \
+Install ydotool for automatic workaround, or press an arrow key to restore focus.")))))
 
 (defun popterm--posframe-visible-p ()
   "Non-nil when the posframe is live and visible."

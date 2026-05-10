@@ -98,7 +98,11 @@ nil         — reuse any popterm buffer.
   :group 'popterm)
 
 (defcustom popterm-auto-cd nil
-  "If non-nil, send a cd to the originating buffer directory on every toggle."
+  "If non-nil, sync the terminal to the originating buffer directory on toggle.
+When the terminal backend updates `default-directory' via directory tracking,
+Popterm only sends `cd' when the tracked terminal directory differs from the
+source buffer directory.  If the backend does not expose a usable tracked
+terminal directory, Popterm falls back to sending `cd' unconditionally."
   :type 'boolean
   :group 'popterm)
 
@@ -171,7 +175,13 @@ on a slow compositor."
 (defvar popterm--active-display-method nil
   "Display method currently used by the active Popterm session.")
 (defvar popterm--saved-mode-line-format nil
-  "Original `mode-line-format' for the active posframe buffer.")
+  "Deprecated compatibility slot for old posframe mode-line state.")
+
+(defvar-local popterm--posframe-saved-mode-line-format nil
+  "Original `mode-line-format' before this buffer was shown in a posframe.")
+
+(defvar-local popterm--posframe-mode-line-was-local nil
+  "Non-nil when `mode-line-format' was buffer-local before posframe display.")
 (defvar popterm--inhibit-hidehandler nil
   "Non-nil while the posframe is being shown, inhibiting the hidehandler.
 Set to t by `popterm--posframe-show' and cleared after
@@ -223,6 +233,12 @@ Popterm cannot rely solely on `buffer-name' to recognize its terminals.")
 
 (defvar-local popterm--buffer-instance-name nil
   "Optional instance name associated with the current Popterm buffer.")
+
+(defvar-local popterm--directory-tracking-enabled nil
+  "Non-nil when the current Popterm buffer has reliable directory tracking.
+Backends or user hooks may set this when `default-directory' reflects the
+terminal process working directory rather than only the buffer creation
+directory.")
 
 (defun popterm--buffer-backend-p (buffer backend)
   "Return non-nil when BUFFER belongs to BACKEND.
@@ -328,11 +344,13 @@ vterm's character-mode input handler passes them to Emacs.
   "Keys added to `vterm-keymap-exceptions' so `popterm-mode' bindings fire.")
 
 (defun popterm--vterm-setup ()
-  "Add `popterm--vterm-passthrough-keys' to `vterm-keymap-exceptions'.
+  "Set up Popterm integration for the current vterm buffer.
 Called from `vterm-mode-hook' so that vterm is guaranteed to be loaded
-before `vterm-keymap-exceptions' is referenced.  vterm makes
-`vterm-keymap-exceptions' buffer-local, so updates here affect only the
-current buffer.  `cl-pushnew' keeps the operation idempotent."
+before `vterm-keymap-exceptions' is referenced.  This marks vterm directory
+tracking as reliable and adds `popterm--vterm-passthrough-keys' to the
+buffer-local `vterm-keymap-exceptions'.  `cl-pushnew' keeps the operation
+idempotent."
+  (setq-local popterm--directory-tracking-enabled t)
   (when (boundp 'vterm-keymap-exceptions)
     (dolist (key popterm--vterm-passthrough-keys)
       (cl-pushnew key vterm-keymap-exceptions :test #'equal))))
@@ -353,6 +371,8 @@ current buffer.  `cl-pushnew' keeps the operation idempotent."
 (defvar eshell-buffer-name)
 (defvar ghostel-buffer-name)
 (defvar ghostel--process)
+(defvar shell-dirtrack-mode)
+(defvar shell-dirtrackp)
 (declare-function eat "eat" ())
 (declare-function eat-self-input "eat" (&optional n event))
 (declare-function eat-term-send-string "eat" (terminal string))
@@ -468,7 +488,10 @@ window or disturb the current layout during creation."
     (with-current-buffer buf
       (setq-local popterm--managed-buffer t
                   popterm--buffer-backend backend
-                  popterm--buffer-instance-name name)
+                  popterm--buffer-instance-name name
+                  popterm--directory-tracking-enabled
+                  (or popterm--directory-tracking-enabled
+                      (eq backend 'eshell)))
       (popterm-mode 1))
     buf))
 
@@ -536,9 +559,10 @@ Guards against a killed-but-not-yet-GC'd buffer by verifying
                      (seq-find (lambda (buf)
                                  (and (buffer-live-p buf)
                                       (popterm--buffer-instance-matches-p buf name b)))
-                               (buffer-list)))))
+                               bufs))))
     (cond
      (exact exact)
+     (name  (popterm--create name b))
      (bufs  (car bufs))
      (t     (popterm--create name b)))))
 
@@ -559,42 +583,139 @@ directory is used as-is."
       (when local
         (format "cd %s" (shell-quote-argument (directory-file-name local)))))))
 
+(defun popterm--terminal-directory (term-buf)
+  "Return the current directory of terminal buffer TERM-BUF, or nil.
+When directory tracking is active (vterm, eat, shell, eshell all update
+`default-directory' via their tracking mechanisms), this reflects the
+shell's actual working directory.  Returns nil when the buffer is dead
+or has no usable directory."
+  (when (buffer-live-p term-buf)
+    (with-current-buffer term-buf
+      (when (stringp default-directory)
+        (expand-file-name default-directory)))))
+
+(defun popterm--same-directory-p (left right)
+  "Return non-nil when directory strings LEFT and RIGHT name the same path."
+  (and (stringp left)
+       (stringp right)
+       (string= (directory-file-name (expand-file-name left))
+                (directory-file-name (expand-file-name right)))))
+
+(defun popterm--remote-identity (dir)
+  "Return TRAMP remote identity for DIR, or nil for local directories."
+  (when (stringp dir)
+    (file-remote-p dir)))
+
+(defun popterm--same-remote-p (source-dir term-dir)
+  "Return non-nil when SOURCE-DIR and TERM-DIR belong to the same host context."
+  (equal (popterm--remote-identity source-dir)
+         (popterm--remote-identity term-dir)))
+
+(defun popterm--directory-tracking-enabled-p (term-buf)
+  "Return non-nil when TERM-BUF has reliable directory tracking enabled."
+  (when (buffer-live-p term-buf)
+    (with-current-buffer term-buf
+      (or popterm--directory-tracking-enabled
+          ;; Eshell owns its evaluator and updates `default-directory'
+          ;; directly when `cd' runs, so it is safe to trust.
+          (derived-mode-p 'eshell-mode)
+          ;; `shell-mode' tracks process cwd only when dirtrack is enabled.
+          (and (derived-mode-p 'shell-mode)
+               (or (bound-and-true-p shell-dirtrack-mode)
+                   (bound-and-true-p shell-dirtrackp)))))))
+
+(defun popterm--terminal-process (term-buf)
+  "Return TERM-BUF's live terminal process, or nil."
+  (when (buffer-live-p term-buf)
+    (with-current-buffer term-buf
+      (cond
+       ((and (derived-mode-p 'ghostel-mode)
+             (boundp 'ghostel--process)
+             (process-live-p ghostel--process))
+        ghostel--process)
+       (t
+        (get-buffer-process term-buf))))))
+
+(defun popterm--local-process-has-child-p (process)
+  "Return non-nil when local PROCESS has a live child process.
+This is a best-effort local heuristic for avoiding input into a busy terminal.
+Emacs does not expose a portable PTY foreground-job API, so this uses `pgrep'
+when available and returns nil when child detection is unavailable."
+  (when-let* ((pgrep (executable-find "pgrep"))
+              (pid (and (processp process)
+                        (process-live-p process)
+                        (process-id process))))
+    (zerop (call-process pgrep nil nil nil "-P" (number-to-string pid)))))
+
+(defun popterm--terminal-busy-p (term-buf)
+  "Return non-nil when TERM-BUF appears to have an active foreground job."
+  (when (buffer-live-p term-buf)
+    (with-current-buffer term-buf
+      (let ((process (popterm--terminal-process term-buf)))
+        (or ;; Eshell has no persistent shell process while idle; a live process
+            ;; associated with the buffer means an external command is running.
+            (and (derived-mode-p 'eshell-mode)
+                 (process-live-p process))
+            ;; Terminal backends keep the shell process alive while idle, so
+            ;; check for local child jobs instead of the shell itself.
+            (popterm--local-process-has-child-p process))))))
+
 (defun popterm--send-cd (term-buf source-buf)
   "Send a cd command into TERM-BUF based on SOURCE-BUF's directory.
+When `popterm-auto-cd' is non-nil and the backend exposes its current
+directory via `default-directory' (directory tracking), Popterm skips the
+cd command if the terminal is already in the target directory.  If the
+backend does not update `default-directory' (i.e. the tracked directory
+cannot be determined), Popterm falls back to sending cd unconditionally.
+
 Uses each backend's dedicated send + return API to avoid PTY newline
 issues: raw \\n is unreliable over a PTY (zsh/fish expect \\r).
 `vterm-send-return' and `eat-self-input' with symbol `return' are the
 correct idioms for their respective backends."
   (when (and (buffer-live-p term-buf)
              (buffer-live-p source-buf))
-    (when-let ((cmd (popterm-cd-string source-buf)))
-      (with-current-buffer term-buf
-        (cond
-         ((and (derived-mode-p 'vterm-mode)
-               (fboundp 'vterm-send-string)
-               (fboundp 'vterm-send-return))
-          (vterm-send-string cmd)
-          (vterm-send-return))
-         ((and (derived-mode-p 'ghostel-mode)
-               (boundp 'ghostel--process)
-               ghostel--process
-               (process-live-p ghostel--process))
-          (process-send-string ghostel--process (concat cmd "\r")))
-         ((and (derived-mode-p 'eat-mode)
-               (fboundp 'eat-term-send-string)
-               (fboundp 'eat-self-input)
-               (boundp 'eat-terminal)
-               eat-terminal)
-          (eat-term-send-string eat-terminal cmd)
-          (eat-self-input 1 'return))
-         ((derived-mode-p 'comint-mode)
-          (goto-char (point-max))
-          (insert cmd)
-          (comint-send-input))
-         ((derived-mode-p 'eshell-mode)
-          (goto-char (point-max))
-          (insert cmd)
-          (eshell-send-input)))))))
+    (when-let* ((cmd (popterm-cd-string source-buf))
+                (target-dir (popterm--buffer-directory source-buf)))
+      (let ((term-dir (popterm--terminal-directory term-buf)))
+        ;; Do not strip a TRAMP prefix and send the resulting local path into a
+        ;; terminal that is local or connected to a different remote identity.
+        ;; Also do not feed cd into a running build or other foreground job.
+        (unless (or (popterm--terminal-busy-p term-buf)
+                    (and term-dir
+                         (not (popterm--same-remote-p target-dir term-dir))))
+          ;; Trust `default-directory' only when the backend has reliable
+          ;; directory tracking.  Otherwise it may just be the stale creation
+          ;; directory, so preserve the historical fallback and send cd.
+          (unless (and (popterm--directory-tracking-enabled-p term-buf)
+                       term-dir
+                       (popterm--same-directory-p target-dir term-dir))
+            (with-current-buffer term-buf
+              (cond
+               ((and (derived-mode-p 'vterm-mode)
+                     (fboundp 'vterm-send-string)
+                     (fboundp 'vterm-send-return))
+                (vterm-send-string cmd)
+                (vterm-send-return))
+               ((and (derived-mode-p 'ghostel-mode)
+                     (boundp 'ghostel--process)
+                     ghostel--process
+                     (process-live-p ghostel--process))
+                (process-send-string ghostel--process (concat cmd "\r")))
+               ((and (derived-mode-p 'eat-mode)
+                     (fboundp 'eat-term-send-string)
+                     (fboundp 'eat-self-input)
+                     (boundp 'eat-terminal)
+                     eat-terminal)
+                (eat-term-send-string eat-terminal cmd)
+                (eat-self-input 1 'return))
+               ((derived-mode-p 'comint-mode)
+                (goto-char (point-max))
+                (insert cmd)
+                (comint-send-input))
+               ((derived-mode-p 'eshell-mode)
+                (goto-char (point-max))
+                (insert cmd)
+                (eshell-send-input))))))))))
 
 ;;; ── Posframe focus guard ──────────────────────────────────────────────────────
 
@@ -681,11 +802,28 @@ The guard is *not* triggered when:
     (cancel-timer popterm--focus-timer)
     (setq popterm--focus-timer nil)))
 
+(defun popterm--hide-buffer-mode-line (buffer)
+  "Hide BUFFER's mode line and record how to restore it later."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq-local popterm--posframe-mode-line-was-local
+                  (local-variable-p 'mode-line-format buffer))
+      (setq-local popterm--posframe-saved-mode-line-format mode-line-format)
+      (setq-local mode-line-format nil))))
+
+(defun popterm--restore-buffer-mode-line (buffer)
+  "Restore BUFFER's mode line after posframe display."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (if popterm--posframe-mode-line-was-local
+          (setq-local mode-line-format popterm--posframe-saved-mode-line-format)
+        (kill-local-variable 'mode-line-format))
+      (setq-local popterm--posframe-saved-mode-line-format nil
+                  popterm--posframe-mode-line-was-local nil))))
+
 (defun popterm--restore-posframe-buffer-state ()
   "Restore buffer-local state temporarily changed for posframe display."
-  (when (buffer-live-p popterm--frame-buffer)
-    (with-current-buffer popterm--frame-buffer
-      (setq-local mode-line-format popterm--saved-mode-line-format)))
+  (popterm--restore-buffer-mode-line popterm--frame-buffer)
   (setq popterm--saved-mode-line-format nil))
 
 (defun popterm--cleanup-posframe-state ()
@@ -807,12 +945,10 @@ Fixes posframe#155 and Centaur Emacs issue #482."
          (frame nil))
     (setq popterm--active-display-method 'posframe
           popterm--frame-buffer buffer)
-    (with-current-buffer buffer
-      ;; Hide the mode line inside the popup for all backends.  Ghostel keeps
-      ;; a normal `mode-line-format', while vterm/eat often appear modeless in
-      ;; practice; suppressing it here keeps posframe presentation consistent.
-      (setq popterm--saved-mode-line-format mode-line-format)
-      (setq-local mode-line-format nil))
+    ;; Hide the mode line inside the popup for all backends.  Ghostel keeps
+    ;; a normal `mode-line-format', while vterm/eat often appear modeless in
+    ;; practice; suppressing it here keeps posframe presentation consistent.
+    (popterm--hide-buffer-mode-line buffer)
     (unwind-protect
         (setq frame
               (posframe-show
@@ -1013,6 +1149,8 @@ For fullscreen: switch to buffer."
     ('posframe
      (when (and (frame-live-p popterm--frame)
                 (buffer-live-p buffer))
+       (popterm--restore-buffer-mode-line popterm--frame-buffer)
+       (popterm--hide-buffer-mode-line buffer)
        (set-window-buffer (frame-root-window popterm--frame) buffer)
        (setq popterm--frame-buffer buffer)
        (with-current-buffer buffer
@@ -1032,7 +1170,7 @@ For fullscreen: switch to buffer."
        (goto-char (point-max))))))
 
 (defun popterm--cycle-message (buffer &optional backend)
-  "Display echo area message showing BUFFER's position in the buffer list.
+  "Display echo area message showing BUFFER's position in BACKEND's buffer list.
 Format: \"popterm [N/M]\" where N is current position, M is total count."
   (let* ((b (or backend popterm-backend))
          (bufs (popterm--buffer-list b))
@@ -1085,13 +1223,16 @@ the window-mode toggle from recreating rather than hiding the terminal."
       (setq popterm--source-buffer (current-buffer))
       (let ((buf
              (cond
-              ;; No buffers: create default
-              ((null bufs)
+              ;; Named commands must select/create that exact instance.
+              (name
                (popterm--get-or-create name b))
-              ;; One buffer: use it
+              ;; No buffers: create default.
+              ((null bufs)
+               (popterm--get-or-create nil b))
+              ;; One buffer: use it.
               ((= (length bufs) 1)
                (car bufs))
-              ;; Multiple buffers: prompt
+              ;; Multiple buffers: prompt.
               (t
                (let* ((candidates
                        (mapcar (lambda (buf)

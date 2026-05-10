@@ -81,6 +81,22 @@
       (popterm-ghostel "named")
       (should (equal called-args '("named" ghostel))))))
 
+(ert-deftest popterm-test-create-vterm-preserves-hook-directory-tracking ()
+  "Test creating a vterm buffer preserves hook-enabled directory tracking."
+  (let ((buffer nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'vterm)
+                   (lambda (buffer-name)
+                     (setq buffer (generate-new-buffer buffer-name))
+                     (with-current-buffer buffer
+                       (setq major-mode 'vterm-mode)
+                       (popterm--vterm-setup)))))
+          (should (eq (popterm--create nil 'vterm) buffer))
+          (with-current-buffer buffer
+            (should (eq popterm--directory-tracking-enabled t))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest popterm-test-buffer-p-survives-ghostel-title-rename ()
   "Test Popterm still recognizes a Ghostel buffer after title-based rename."
   (let ((buffer (generate-new-buffer "*ghostel: host: ~/project*")))
@@ -154,6 +170,7 @@
         (progn
           (with-current-buffer term-buf
             (setq major-mode 'ghostel-mode)
+            (setq default-directory "/var/tmp/")
             (setq ghostel--process 'ghostel-proc))
           (with-current-buffer source-buf
             (setq default-directory "/tmp/"))
@@ -167,6 +184,171 @@
             (should (equal sent-command "cd /tmp\r"))))
       (kill-buffer term-buf)
       (kill-buffer source-buf))))
+
+(ert-deftest popterm-test-send-cd-skips-when-created-vterm-directory-matches ()
+  "Test auto-cd skips command when created vterm directory matches."
+  (let ((sent-command nil)
+        (sent-return nil)
+        (term-buf nil)
+        (source-buf (generate-new-buffer " *popterm-source-cd-same*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer source-buf
+            (setq default-directory "/tmp/"))
+          (cl-letf (((symbol-function 'vterm)
+                     (lambda (buffer-name)
+                       (setq term-buf (generate-new-buffer buffer-name))
+                       (with-current-buffer term-buf
+                         (setq major-mode 'vterm-mode)
+                         (setq default-directory "/tmp/")
+                         (popterm--vterm-setup))))
+                    ((symbol-function 'vterm-send-string)
+                     (lambda (string)
+                       (setq sent-command string)))
+                    ((symbol-function 'vterm-send-return)
+                     (lambda ()
+                       (setq sent-return t))))
+            (setq term-buf (popterm--create nil 'vterm))
+            (popterm--send-cd term-buf source-buf)
+            (should-not sent-command)
+            (should-not sent-return)))
+      (when (buffer-live-p term-buf)
+        (kill-buffer term-buf))
+      (kill-buffer source-buf))))
+
+(ert-deftest popterm-test-send-cd-skips-busy-terminal ()
+  "Test auto-cd does not send command while terminal is busy."
+  (let ((sent-command nil)
+        (term-buf (generate-new-buffer " *popterm-busy*"))
+        (source-buf (generate-new-buffer " *popterm-source-busy*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (setq major-mode 'ghostel-mode)
+            (setq default-directory "/var/tmp/")
+            (setq ghostel--process 'ghostel-proc))
+          (with-current-buffer source-buf
+            (setq default-directory "/tmp/"))
+          (cl-letf (((symbol-function 'popterm--terminal-busy-p)
+                     (lambda (_term-buf) t))
+                    ((symbol-function 'process-live-p)
+                     (lambda (process)
+                       (eq process 'ghostel-proc)))
+                    ((symbol-function 'process-send-string)
+                     (lambda (_process string)
+                       (setq sent-command string))))
+            (popterm--send-cd term-buf source-buf)
+            (should-not sent-command)))
+      (kill-buffer term-buf)
+      (kill-buffer source-buf))))
+
+(ert-deftest popterm-test-terminal-busy-p-uses-child-process-helper ()
+  "Test terminal busy detection delegates to local child-process helper."
+  (let ((process 'terminal-process)
+        (term-buf (generate-new-buffer " *popterm-child-busy*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (setq major-mode 'vterm-mode))
+          (cl-letf (((symbol-function 'get-buffer-process)
+                     (lambda (_buffer) process))
+                    ((symbol-function 'popterm--local-process-has-child-p)
+                     (lambda (candidate)
+                       (eq candidate process))))
+            (should (popterm--terminal-busy-p term-buf))))
+      (when (buffer-live-p term-buf)
+        (kill-buffer term-buf)))))
+
+(ert-deftest popterm-test-send-cd-skips-remote-mismatch ()
+  "Test auto-cd does not send localname into a mismatched remote terminal."
+  (let ((sent-command nil)
+        (term-buf (generate-new-buffer " *popterm-remote-mismatch*"))
+        (source-buf (generate-new-buffer " *popterm-source-remote*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (setq major-mode 'ghostel-mode)
+            (setq default-directory "/tmp/")
+            (setq ghostel--process 'ghostel-proc))
+          (cl-letf (((symbol-function 'popterm-cd-string)
+                     (lambda (_source-buf) "cd /tmp"))
+                    ((symbol-function 'popterm--buffer-directory)
+                     (lambda (&optional buffer)
+                       (cond
+                        ((eq buffer source-buf) "/ssh:host:/tmp/")
+                        ((eq buffer term-buf) "/tmp/")
+                        (t "/tmp/"))))
+                    ((symbol-function 'popterm--terminal-directory)
+                     (lambda (_term-buf) "/tmp/"))
+                    ((symbol-function 'process-live-p)
+                     (lambda (process)
+                       (eq process 'ghostel-proc)))
+                    ((symbol-function 'process-send-string)
+                     (lambda (_process string)
+                       (setq sent-command string))))
+            (popterm--send-cd term-buf source-buf)
+            (should-not sent-command)))
+      (kill-buffer term-buf)
+      (kill-buffer source-buf))))
+
+(ert-deftest popterm-test-send-cd-falls-back-without-tracked-directory ()
+  "Test auto-cd sends command when terminal directory tracking is unavailable."
+  (let ((sent-command nil)
+        (term-buf (generate-new-buffer " *popterm-ghostel-cd-untracked*"))
+        (source-buf (generate-new-buffer " *popterm-source-cd-untracked*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer term-buf
+            (setq major-mode 'ghostel-mode)
+            ;; This can be the stale creation directory when tracking is off;
+            ;; matching it must not suppress the cd command.
+            (setq default-directory "/tmp/")
+            (setq ghostel--process 'ghostel-proc))
+          (with-current-buffer source-buf
+            (setq default-directory "/tmp/"))
+          (cl-letf (((symbol-function 'process-live-p)
+                     (lambda (process)
+                       (eq process 'ghostel-proc)))
+                    ((symbol-function 'process-send-string)
+                     (lambda (_process string)
+                       (setq sent-command string))))
+            (popterm--send-cd term-buf source-buf)
+            (should (equal sent-command "cd /tmp\r"))))
+      (kill-buffer term-buf)
+      (kill-buffer source-buf))))
+
+(ert-deftest popterm-test-directory-tracking-enabled-p-explicit-marker ()
+  "Test explicit tracking marker enables directory tracking trust."
+  (let ((term-buf (generate-new-buffer " *popterm-vterm-tracking*")))
+    (unwind-protect
+        (with-current-buffer term-buf
+          (setq-local popterm--buffer-backend 'vterm)
+          (should-not (popterm--directory-tracking-enabled-p term-buf))
+          (setq-local popterm--directory-tracking-enabled t)
+          (should (popterm--directory-tracking-enabled-p term-buf)))
+      (kill-buffer term-buf))))
+
+(ert-deftest popterm-test-directory-tracking-enabled-p-rejects-ghostel-default ()
+  "Test Ghostel `default-directory' alone is not treated as tracking."
+  (let ((term-buf (generate-new-buffer " *popterm-ghostel-no-tracking*")))
+    (unwind-protect
+        (with-current-buffer term-buf
+          (setq major-mode 'ghostel-mode)
+          (setq default-directory "/tmp/")
+          (should-not (popterm--directory-tracking-enabled-p term-buf)))
+      (kill-buffer term-buf))))
+
+(ert-deftest popterm-test-directory-tracking-enabled-p-shell-dirtrack ()
+  "Test shell dirtrack mode is evaluated live."
+  (let ((term-buf (generate-new-buffer " *popterm-shell-dirtrack*")))
+    (unwind-protect
+        (with-current-buffer term-buf
+          (setq major-mode 'shell-mode)
+          (setq-local shell-dirtrack-mode nil)
+          (should-not (popterm--directory-tracking-enabled-p term-buf))
+          (setq-local shell-dirtrack-mode t)
+          (should (popterm--directory-tracking-enabled-p term-buf)))
+      (kill-buffer term-buf))))
 
 (ert-deftest popterm-test-project-root-graceful-nil ()
   "Test project-root returns nil gracefully for buffers without projects."
@@ -259,6 +441,30 @@
             (should (null created-args))))
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
+
+(ert-deftest popterm-test-get-or-create-named-respects-scope ()
+  "Test named lookup does not reuse buffers outside current scope."
+  (let ((out-of-scope (generate-new-buffer "*popterm-vterm[named]*"))
+        (created-args nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer out-of-scope
+            (setq major-mode 'vterm-mode)
+            (setq-local popterm--managed-buffer t
+                        popterm--buffer-backend 'vterm
+                        popterm--buffer-instance-name "named"))
+          (cl-letf (((symbol-function 'buffer-list)
+                     (lambda () (list out-of-scope)))
+                    ((symbol-function 'popterm--buffer-list)
+                     (lambda (_backend) nil))
+                    ((symbol-function 'popterm--create)
+                     (lambda (&rest args)
+                       (setq created-args args)
+                       'created-buffer)))
+            (should (eq (popterm--get-or-create "named" 'vterm)
+                        'created-buffer))
+            (should (equal created-args '("named" vterm)))))
+      (kill-buffer out-of-scope))))
 
 (ert-deftest popterm-test-buffer-list-filters-dead-buffers ()
   "Test that dead buffers are filtered out of buffer list."
@@ -444,8 +650,10 @@
                     ((symbol-function 'popterm--install-theme-watch) #'ignore))
             (popterm--posframe-show buffer)
             (with-current-buffer buffer
-              (should (null mode-line-format)))
-            (should (equal popterm--saved-mode-line-format '(" Demo")))
+              (should (null mode-line-format))
+              (should (equal popterm--posframe-saved-mode-line-format
+                             '(" Demo")))
+              (should popterm--posframe-mode-line-was-local))
             (should (equal (plist-get (cdr captured-args) :respect-mode-line)
                            nil))))
       (when (buffer-live-p buffer)
@@ -455,6 +663,20 @@
             popterm--saved-mode-line-format nil
             popterm--focus-timer nil
             popterm--active-display-method nil))))
+
+(ert-deftest popterm-test-posframe-restore-removes-inherited-mode-line-local ()
+  "Verify inherited mode line does not remain buffer-local after restore."
+  (let ((buffer (get-buffer-create "*popterm-inherited-modeline*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (kill-local-variable 'mode-line-format))
+          (popterm--hide-buffer-mode-line buffer)
+          (popterm--restore-buffer-mode-line buffer)
+          (with-current-buffer buffer
+            (should-not (local-variable-p 'mode-line-format buffer))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
 
 (ert-deftest popterm-test-posframe-hide-cleans-focus-timer ()
   "Verify `popterm--posframe-hide' cancels and clears the focus timer."
@@ -478,9 +700,9 @@
     (unwind-protect
         (progn
           (with-current-buffer buffer
-            (setq-local mode-line-format nil))
-          (setq popterm--frame-buffer buffer
-                popterm--saved-mode-line-format original)
+            (setq-local mode-line-format original))
+          (popterm--hide-buffer-mode-line buffer)
+          (setq popterm--frame-buffer buffer)
           (cl-letf (((symbol-function 'popterm--remove-focus-guard) #'ignore)
                     ((symbol-function 'popterm--remove-display-buffer-guard) #'ignore)
                     ((symbol-function 'popterm--remove-theme-watch) #'ignore))
@@ -789,18 +1011,30 @@
          (popterm--frame-buffer old-buf)
          (set-win-buf-calls nil))
     (unwind-protect
-        (cl-letf (((symbol-function 'popterm--effective-display-method)
-                   (lambda () 'posframe))
-                  ((symbol-function 'set-window-buffer)
-                   (lambda (win buf)
-                     (push (list win buf) set-win-buf-calls)))
-                  ((symbol-function 'frame-root-window)
-                   (lambda (_frame) 'root-win))
-                  ((symbol-function 'frame-live-p) (lambda (_f) t)))
-          (popterm--show-in-place new-buf)
-          (should (equal (caar set-win-buf-calls) 'root-win))
-          (should (eq (cadar set-win-buf-calls) new-buf))
-          (should (eq popterm--frame-buffer new-buf)))
+        (progn
+          (with-current-buffer old-buf
+            (setq-local mode-line-format '(" Old")))
+          (with-current-buffer new-buf
+            (setq-local mode-line-format '(" New")))
+          (popterm--hide-buffer-mode-line old-buf)
+          (cl-letf (((symbol-function 'popterm--effective-display-method)
+                     (lambda () 'posframe))
+                    ((symbol-function 'set-window-buffer)
+                     (lambda (win buf)
+                       (push (list win buf) set-win-buf-calls)))
+                    ((symbol-function 'frame-root-window)
+                     (lambda (_frame) 'root-win))
+                    ((symbol-function 'frame-live-p) (lambda (_f) t)))
+            (popterm--show-in-place new-buf)
+            (should (equal (caar set-win-buf-calls) 'root-win))
+            (should (eq (cadar set-win-buf-calls) new-buf))
+            (should (eq popterm--frame-buffer new-buf))
+            (with-current-buffer old-buf
+              (should (equal mode-line-format '(" Old"))))
+            (with-current-buffer new-buf
+              (should (null mode-line-format))
+              (should (equal popterm--posframe-saved-mode-line-format
+                             '(" New"))))))
       (kill-buffer old-buf)
       (kill-buffer new-buf))))
 
@@ -866,6 +1100,30 @@
             (should (buffer-live-p shown-buf)))
         (when (buffer-live-p shown-buf)
           (kill-buffer shown-buf))))))
+
+(ert-deftest popterm-test-toggle-named-selects-requested-instance ()
+  "Test named toggle selects requested instance even when another buffer exists."
+  (let ((existing-buf (generate-new-buffer "*popterm-vterm*"))
+        (named-buf (generate-new-buffer "*popterm-vterm[named]*"))
+        (shown-buf nil)
+        (requested-name nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'popterm--visible-p) (lambda () nil))
+                  ((symbol-function 'popterm--window-hide) #'ignore)
+                  ((symbol-function 'popterm--buffer-list)
+                   (lambda (_b) (list existing-buf)))
+                  ((symbol-function 'popterm--get-or-create)
+                   (lambda (name _backend)
+                     (setq requested-name name)
+                     named-buf))
+                  ((symbol-function 'popterm--show)
+                   (lambda (b) (setq shown-buf b)))
+                  ((symbol-function 'popterm--send-cd) #'ignore))
+          (popterm-toggle "named" 'vterm)
+          (should (equal requested-name "named"))
+          (should (eq shown-buf named-buf)))
+      (kill-buffer existing-buf)
+      (kill-buffer named-buf))))
 
 (ert-deftest popterm-test-toggle-single-buffer-no-completion ()
   "Test single buffer toggle shows directly without completing-read."

@@ -237,7 +237,8 @@ via ~setq~ in your init file.
 *** Auto-CD & Creation Behavior
 
 #+BEGIN_SRC emacs-lisp
-;; Always cd to the source buffer's directory on every toggle
+;; Sync terminal to the source buffer's directory when needed.
+;; With reliable directory tracking, Popterm skips cd when already there.
 (setq popterm-auto-cd t)
 
 ;; Allow popterm-toggle-cd to create a new terminal when none exists in scope

@@ -20,9 +20,10 @@
 
 ;;; Code:
 
-(require 'ert)
 (require 'bytecomp)
+(require 'ert)
 (require 'popterm)
+(require 'shell)
 
 (defvar vterm-keymap-exceptions)
 (defvar posframe--frame)

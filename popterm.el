@@ -379,6 +379,7 @@ idempotent."
 (declare-function eshell "esh-mode" (&optional arg))
 (declare-function eshell-send-input "esh-mode" ())
 (declare-function ghostel "ghostel" ())
+(declare-function ghostel-send-key "ghostel" (key))
 (declare-function posframe-hide "posframe" (buffer-or-name))
 (declare-function posframe-poshandler-frame-center "posframe" (info))
 (declare-function posframe-show "posframe" (buffer-or-name &rest args))
@@ -398,6 +399,19 @@ idempotent."
     ('eat     'eat-mode)
     ('shell   'shell-mode)
     ('eshell  'eshell-mode)))
+
+(defun popterm--reset-cursor-point (buffer)
+  "Reset cursor position for terminal BUFFER after display."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (goto-char (point-max))
+      (cond
+       ((and (derived-mode-p 'vterm-mode)
+             (fboundp 'vterm-reset-cursor-point))
+        (vterm-reset-cursor-point))
+       ((and (derived-mode-p 'ghostel-mode)
+             (fboundp 'ghostel-send-key))
+        (ghostel-send-key "down"))))))
 
 (defun popterm--buffer-name (&optional name backend)
   "Return canonical buffer name for BACKEND with optional instance NAME."
@@ -491,7 +505,7 @@ window or disturb the current layout during creation."
                   popterm--buffer-instance-name name
                   popterm--directory-tracking-enabled
                   (or popterm--directory-tracking-enabled
-                      (memq backend '(eshell ghostel eat))))
+                      (memq backend '(eshell eat))))
       (popterm-mode 1))
     buf))
 
@@ -619,8 +633,6 @@ or has no usable directory."
           ;; Eshell owns its evaluator and updates `default-directory'
           ;; directly when `cd' runs, so it is safe to trust.
           (derived-mode-p 'eshell-mode)
-          ;; Ghostel updates `default-directory' via its process filter.
-          (derived-mode-p 'ghostel-mode)
           ;; Eat updates `default-directory' via OSC 7 directory tracking.
           (derived-mode-p 'eat-mode)
           ;; `shell-mode' tracks process cwd only when dirtrack is enabled.
@@ -989,10 +1001,8 @@ Fixes posframe#155 and Centaur Emacs issue #482."
                             (setq popterm--focus-timer nil))))
     (select-frame-set-input-focus popterm--frame)
     (with-current-buffer buffer
-      (setq-local cursor-type 'box)
-      (goto-char (point-max))
-      (when (fboundp 'vterm-reset-cursor-point)
-        (vterm-reset-cursor-point)))
+      (setq-local cursor-type 'box))
+    (popterm--reset-cursor-point buffer)
     ;; Install guards so that operations landing focus on the parent
     ;; frame return to the posframe, and external `display-buffer' calls
     ;; cannot re-display popterm buffers in regular split windows.
@@ -1058,7 +1068,7 @@ lifecycle correctly, avoiding orphaned frames."
     (set-window-buffer win buffer)
     (setq popterm--window win)
     (select-window win)
-    (with-current-buffer buffer (goto-char (point-max)))))
+    (popterm--reset-cursor-point buffer)))
 
 (defun popterm--window-hide ()
   "Delete the split window and dereference it."
@@ -1122,7 +1132,7 @@ between named instances and then pressing the toggle key hides correctly."
     ('posframe   (popterm--posframe-show buffer))
     ('window     (popterm--window-show   buffer))
     ('fullscreen (switch-to-buffer buffer)
-                 (goto-char (point-max)))))
+                 (popterm--reset-cursor-point buffer))))
 
 ;;; ── Helper functions for multi-instance support ───────────────────────────────
 
@@ -1157,21 +1167,17 @@ For fullscreen: switch to buffer."
        (popterm--hide-buffer-mode-line buffer)
        (set-window-buffer (frame-root-window popterm--frame) buffer)
        (setq popterm--frame-buffer buffer)
-       (with-current-buffer buffer
-         (goto-char (point-max))
-         (when (fboundp 'vterm-reset-cursor-point)
-           (vterm-reset-cursor-point)))))
+       (popterm--reset-cursor-point buffer)))
     ('window
      (when (and (window-live-p popterm--window)
                 (buffer-live-p buffer))
        (set-window-buffer popterm--window buffer)
        (select-window popterm--window)
-       (with-current-buffer buffer
-         (goto-char (point-max)))))
+       (popterm--reset-cursor-point buffer)))
     ('fullscreen
      (when (buffer-live-p buffer)
        (switch-to-buffer buffer)
-       (goto-char (point-max))))))
+       (popterm--reset-cursor-point buffer)))))
 
 (defun popterm--cycle-message (buffer &optional backend)
   "Display echo area message showing BUFFER's position in BACKEND's buffer list.

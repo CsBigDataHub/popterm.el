@@ -30,6 +30,7 @@
 (defvar ghostel--process)
 
 (declare-function popterm--next-numeric-index "popterm")
+(declare-function popterm--reset-cursor-point "popterm")
 (declare-function popterm--show-in-place "popterm")
 (declare-function popterm--cycle-message "popterm")
 
@@ -849,6 +850,26 @@
               (popterm--show buffer))
             (should (eq popterm--active-display-method 'window))))
       (kill-buffer buffer))))
+
+(ert-deftest popterm-test-reset-cursor-point-ghostel ()
+  "Verify Ghostel display reset sends a down key to refresh cursor state."
+  (let ((buffer (get-buffer-create "*popterm-ghostel-cursor*"))
+        (sent-key nil))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (setq major-mode 'ghostel-mode)
+            (insert "prompt")
+            (goto-char (point-min)))
+          (cl-letf (((symbol-function 'ghostel-send-key)
+                     (lambda (key)
+                       (setq sent-key key))))
+            (popterm--reset-cursor-point buffer))
+          (should (equal sent-key "down"))
+          (with-current-buffer buffer
+            (should (= (point) (point-max)))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
 
 (ert-deftest popterm-test-vterm-setup-updates-buffer-local-exceptions ()
   "Verify `popterm--vterm-setup' only updates the current buffer's exceptions."
